@@ -106,6 +106,51 @@ const DELETE_JS: &str = "(function() {\
     t.dispatchEvent(globalThis.__obscura_markTrusted(new Event('input', {bubbles:true})));\
 })()";
 
+// Sequential focus navigation, the default action of an uncanceled Tab
+// keydown (HTML §6.6.3). Candidates are focusable, enabled, rendered and have
+// tabIndex >= 0 (rendered is judged by computed display/visibility: Obscura
+// reports no client rects for inline boxes); positive tabIndex values come
+// first in ascending order, then tabIndex 0 in document order. $BACKWARD is
+// replaced with Shift. From an element outside the order, navigation continues
+// from its document position.
+// The order wraps at both ends, as headless Chrome does with no browser UI.
+const TAB_JS: &str = "(function(backward) {\
+    var sel = 'a[href],area[href],button,input,select,textarea,iframe,summary,[tabindex],[contenteditable]';\
+    var all = Array.prototype.slice.call(document.querySelectorAll(sel)).filter(function(el) {\
+        if (el.disabled) return false;\
+        if (el.localName === 'input' && String(el.type || '').toLowerCase() === 'hidden') return false;\
+        var ti = el.hasAttribute('tabindex') || el.localName !== 'summary' ? el.tabIndex : 0;\
+        if (el.hasAttribute('contenteditable') && !el.hasAttribute('tabindex')) ti = el.getAttribute('contenteditable') === 'false' ? -1 : 0;\
+        if (!(ti >= 0)) return false;\
+        if (typeof getComputedStyle === 'function') {\
+            for (var n = el; n && n.nodeType === 1; n = n.parentElement) {\
+                if (getComputedStyle(n).display === 'none') return false;\
+            }\
+            if (getComputedStyle(el).visibility === 'hidden') return false;\
+        }\
+        el.__obscuraTabIndex = ti;\
+        return true;\
+    });\
+    var order = all.filter(function(el) { return el.__obscuraTabIndex > 0; })\
+        .sort(function(a, b) { return a.__obscuraTabIndex - b.__obscuraTabIndex; })\
+        .concat(all.filter(function(el) { return el.__obscuraTabIndex === 0; }));\
+    all.forEach(function(el) { delete el.__obscuraTabIndex; });\
+    if (!order.length) return;\
+    var cur = document.activeElement;\
+    var i = order.indexOf(cur);\
+    var next;\
+    if (i >= 0) {\
+        next = backward ? order[(i - 1 + order.length) % order.length] : order[(i + 1) % order.length];\
+    } else if (cur && cur !== document.body && typeof cur.compareDocumentPosition === 'function') {\
+        var after = order.filter(function(el) { return cur.compareDocumentPosition(el) & 4; });\
+        var before = order.filter(function(el) { return cur.compareDocumentPosition(el) & 2; });\
+        next = backward ? (before.length ? before[before.length - 1] : order[order.length - 1]) : (after.length ? after[0] : order[0]);\
+    } else {\
+        next = backward ? order[order.length - 1] : order[0];\
+    }\
+    if (next && typeof next.focus === 'function') next.focus();\
+})($BACKWARD)";
+
 fn mouse_button_code(button: &str) -> u8 {
     match button {
         "middle" => 1,
@@ -483,6 +528,10 @@ pub async fn handle(
 
                         if key == "Delete" {
                             page.evaluate(DELETE_JS);
+                        }
+
+                        if key == "Tab" && !alt_key && !ctrl_key && !meta_key {
+                            page.evaluate(&TAB_JS.replace("$BACKWARD", if shift_key { "true" } else { "false" }));
                         }
                     }
                     "keyUp" => {
