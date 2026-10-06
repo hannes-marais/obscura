@@ -1067,6 +1067,15 @@ const _coerceTimerFn = (fn) => {
   return typeof fn === "function" ? fn : null;
 };
 
+// HTML "report the exception" for callbacks the page hands the platform
+// (timers, animation frames, posted tasks, event listeners): fire an
+// ErrorEvent at the global and, unless it is canceled, surface the error to
+// the console and to CDP Runtime.exceptionThrown. Swallowing into
+// console.error hid these from window.onerror and from automation.
+// Rebound to the real reporter once ErrorEvent exists (see
+// setReportExceptionCallback below); until then a callback error is logged.
+let _reportCallbackException = (error) => console.error(error);
+
 let _timerTaskNestingLevel = 0;
 const _timerDelayForNesting = (delay, nestingLevel) =>
   nestingLevel > 5 ? Math.max(4, delay) : delay;
@@ -1094,7 +1103,7 @@ globalThis.setTimeout = (fn, delay = 0, ...args) => {
       __obscuraPendingTimeoutDeadlines.delete(id);
       if (state.cancelled) return;
       _runTimerTask(taskNestingLevel, () => {
-        try { f(...args); } catch(e) { console.error("Timer error:", e); }
+        try { f(...args); } catch(e) { _reportCallbackException(e); }
       });
     },
   );
@@ -1129,7 +1138,7 @@ globalThis.setInterval = (fn, delay = 0, ...args) => {
   const tick = () => {
     if (!_intervals.has(id)) return;
     _runTimerTask(taskNestingLevel, () => {
-      try { f(...args); } catch(e) { console.error("Interval error:", e); }
+      try { f(...args); } catch(e) { _reportCallbackException(e); }
     });
     if (!_intervals.has(id)) return;
     const nextDelay = _timerDelayForNesting(normalizedDelay, taskNestingLevel);
@@ -1223,7 +1232,7 @@ function _runAnimationFrameBatch() {
       if (!batch.has(id)) continue;
       batch.delete(id);
       try { callback(timestamp); }
-      catch (e) { console.error("Animation frame error:", e); }
+      catch (e) { _reportCallbackException(e); }
     }
   } finally {
     _rafRunningFrame = false;
@@ -1320,7 +1329,7 @@ function _browserPostedTaskRunOne(currentGeneration = _invalidPostedTaskGenerati
 
   __obscuraCore.ops.op_begin_render_task?.();
   try { callback(); }
-  catch (error) { console.error("Posted task error:", error); }
+  catch (error) { _reportCallbackException(error); }
   finally {
     if (_browserPostedTaskQueues.some(queue => queue.length)) {
       _browserPostedTaskScheduleWake();
@@ -2026,7 +2035,7 @@ function _eventTargetDispatch(target, event) {
       try {
         if (eventHandler.call(target, event) === false) event.preventDefault();
       } catch (error) {
-        console.error(error);
+        _reportCallbackException(error);
       }
     }
     const listeners = (_eventTargetListeners.get(target)?.get(String(event.type)) || []).slice();
@@ -2039,7 +2048,7 @@ function _eventTargetDispatch(target, event) {
         if (typeof callback === "function") callback.call(target, event);
         else callback.handleEvent.call(callback, event);
       } catch (error) {
-        console.error(error);
+        _reportCallbackException(error);
       }
       if (event._immediatePropagationStopped) break;
     }
@@ -2066,7 +2075,7 @@ function _domEventInvoke(target, event, capture, phase) {
       try {
         if (inlineFn.call(target, event) === false) event.preventDefault();
       } catch (error) {
-        console.error(error);
+        _reportCallbackException(error);
       }
     }
   }
@@ -2081,7 +2090,7 @@ function _domEventInvoke(target, event, capture, phase) {
       if (typeof entry.callback === "function") entry.callback.call(target, event);
       else entry.callback.handleEvent.call(entry.callback, event);
     } catch (error) {
-      console.error(error);
+      _reportCallbackException(error);
     }
     if (event._immediatePropagationStopped) break;
   }
@@ -10832,18 +10841,29 @@ globalThis.FocusEvent = class extends Event { constructor(t,o={}) { super(t,o);t
 globalThis.InputEvent = class extends Event { constructor(t,o={}) { super(t,o);this.data=o.data||null;this.inputType=o.inputType||""; } };
 globalThis.ErrorEvent = class extends Event { constructor(t,o={}) { super(t,o);this.message=o.message||"";this.error=o.error||null; } };
 const _browserErrorEvent = globalThis.ErrorEvent;
-__obscuraCore.setReportExceptionCallback(error => {
+let _reportingException = false;
+const _reportBrowserException = error => {
   // deno_core's default reporter terminates execution, discarding the rest of
   // the microtask checkpoint. Browser callback errors must leave queued work live.
-  let message;
-  try { message = String(error?.message ?? error); }
-  catch (_) { message = "Uncaught exception"; }
-  const event = new _browserErrorEvent("error", { message, error, cancelable: true });
-  if (_eventTargetDispatch(globalThis, event)) {
-    __obscuraCore.ops.op_report_browser_exception(error, globalThis.__obscura_frameId || 0);
-    _consoleFn("error", [error]);
+  // An error thrown by an "error" listener while reporting is logged rather
+  // than reported again, so a throwing onerror cannot recurse.
+  if (_reportingException) { _consoleFn("error", [error]); return; }
+  _reportingException = true;
+  try {
+    let message;
+    try { message = String(error?.message ?? error); }
+    catch (_) { message = "Uncaught exception"; }
+    const event = new _browserErrorEvent("error", { message, error, cancelable: true });
+    if (_eventTargetDispatch(globalThis, event)) {
+      __obscuraCore.ops.op_report_browser_exception(error, globalThis.__obscura_frameId || 0);
+      _consoleFn("error", [error]);
+    }
+  } finally {
+    _reportingException = false;
   }
-});
+};
+__obscuraCore.setReportExceptionCallback(_reportBrowserException);
+_reportCallbackException = _reportBrowserException;
 globalThis.PointerEvent = class extends MouseEvent {
   constructor(t,o={}) {
     super(t,o);
