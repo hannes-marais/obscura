@@ -37,6 +37,17 @@ pub(crate) struct ScreencastState {
     pub autonomous_frame_pending: bool,
 }
 
+#[derive(Clone, Debug)]
+pub(crate) struct ExecutionContextRecord {
+    pub id: i64,
+    pub unique_id: String,
+    pub page_id: String,
+    pub frame_id: String,
+    pub origin: String,
+    pub world_name: String,
+    pub is_default: bool,
+}
+
 pub struct CdpContext {
     pub pages: Vec<Page>,
     pub sessions: HashMap<String, String>, // session_id -> page_id
@@ -44,6 +55,11 @@ pub struct CdpContext {
     /// script-initiated Network events must share this id; inventing a loader
     /// for each fetch breaks DevTools request grouping.
     pub current_loader_ids: HashMap<String, String>,
+    /// Pages whose initial navigation event sequence has been emitted. A page
+    /// is created already loaded (about:blank), but Chrome emits that load's
+    /// events when the client attaches; Page.enable emits them once per page
+    /// so clients waiting on the initial load (chromiumoxide, #833) unblock.
+    pub nav_events_emitted: std::collections::HashSet<String>,
     /// Child frame ids already reported to the client, per page, so each frame
     /// is announced once and a frame that goes away can be retracted.
     pub announced_frames: HashMap<String, Vec<String>>,
@@ -68,18 +84,13 @@ pub struct CdpContext {
     /// Sessions that called Runtime.enable. Console and exception events are
     /// page-scoped but only delivered to these subscribers.
     pub runtime_enabled_sessions: HashSet<String>,
-    // World names registered via Page.createIsolatedWorld. After every
-    // navigation Obscura clears execution contexts (via
-    // Runtime.executionContextsCleared) and must re-emit a
-    // Runtime.executionContextCreated for each registered world, otherwise
-    // Playwright/Puppeteer hang waiting for their utility world to come
-    // back. Stored as plain Strings (not by-page) — for now we only model
-    // a single page in CdpContext anyway.
+    /// Page.setLifecycleEventsEnabled subscriptions, independent of Runtime.
+    pub(crate) lifecycle_enabled_sessions: HashSet<String>,
+    // Legacy direct-embedder configuration. Protocol-created worlds live only
+    // in `page_isolated_worlds`, so this vector does not grow with page churn.
     pub isolated_worlds: Vec<String>,
-    // Set of executionContextIds Obscura has emitted via
-    // Runtime.executionContextCreated. Pre-populated with the default-frame
-    // contexts (`1`, `2`) that Runtime.enable / Page.navigate emit, then
-    // extended each time Page.createIsolatedWorld assigns a fresh id.
+    // Set of allocated executionContextIds. An id is routable for an attached
+    // session only when `execution_contexts` also records the owning page.
     //
     // Runtime.evaluate / Runtime.callFunctionOn consult this set to reject
     // requests targeting an unknown context — matching real Chrome's
@@ -94,6 +105,10 @@ pub struct CdpContext {
     // claims and increments from this counter so the ids real Chrome would
     // emit (incrementing, never reused) are mirrored.
     pub next_isolated_context_id: i64,
+    next_default_context_id: i64,
+    execution_contexts: HashMap<i64, ExecutionContextRecord>,
+    page_contexts: HashMap<String, Vec<i64>>,
+    page_isolated_worlds: HashMap<String, Vec<String>>,
     pub fetch_intercept: FetchInterceptState,
     pub intercept_tx: Option<tokio::sync::mpsc::UnboundedSender<InterceptedRequest>>,
     // Open IO streams for Fetch.takeResponseBodyAsStream. Each holds a response
@@ -155,18 +170,12 @@ impl CdpContext {
     /// context. The server passes a fresh isolated context per WebSocket; tests
     /// and embedders may construct their own.
     pub fn new_with_shared_context(default_context: Arc<BrowserContext>) -> Self {
-        // Pre-seed with the default-frame execution context ids that
-        // `Runtime.enable` (1) and post-navigation re-emission (2) advertise via
-        // Runtime.executionContextCreated. Anything else has to be registered
-        // explicitly (Page.createIsolatedWorld), otherwise
-        // Runtime.{evaluate,callFunctionOn} should reject it per CDP spec.
-        let mut valid_context_ids = HashSet::new();
-        valid_context_ids.insert(1);
-        valid_context_ids.insert(2);
+        let valid_context_ids = HashSet::new();
         CdpContext {
             pages: Vec::new(),
             sessions: HashMap::new(),
             current_loader_ids: HashMap::new(),
+            nav_events_emitted: std::collections::HashSet::new(),
             announced_frames: HashMap::new(),
             pending_events: Vec::new(),
             #[cfg(feature = "render")]
@@ -181,12 +190,17 @@ impl CdpContext {
             preload_scripts: Vec::new(),
             binding_sessions: HashMap::new(),
             runtime_enabled_sessions: HashSet::new(),
+            lifecycle_enabled_sessions: HashSet::new(),
             preload_counter: 0,
             fetch_intercept: FetchInterceptState::new(),
             intercept_tx: None,
             isolated_worlds: Vec::new(),
             valid_context_ids,
             next_isolated_context_id: 100,
+            next_default_context_id: 1,
+            execution_contexts: HashMap::new(),
+            page_contexts: HashMap::new(),
+            page_isolated_worlds: HashMap::new(),
             io_streams: crate::domains::io::IoStreamStore::default(),
             v8_lock: Arc::new(tokio::sync::Mutex::new(())),
         }
@@ -215,8 +229,15 @@ impl CdpContext {
     /// Claim the next isolated-world execution context id and register it as
     /// valid for `Runtime.evaluate`/`callFunctionOn`. Issue #192.
     pub fn next_isolated_context(&mut self) -> i64 {
+        while self.valid_context_ids.contains(&self.next_isolated_context_id)
+            || self.execution_contexts.contains_key(&self.next_isolated_context_id)
+        {
+            self.next_isolated_context_id = self.next_isolated_context_id.checked_add(1)
+                .expect("execution context id space exhausted");
+        }
         let id = self.next_isolated_context_id;
-        self.next_isolated_context_id += 1;
+        self.next_isolated_context_id = id.checked_add(1)
+            .expect("execution context id space exhausted");
         self.valid_context_ids.insert(id);
         id
     }
@@ -327,8 +348,162 @@ impl CdpContext {
         }
         for session_id in &removed_sessions {
             self.runtime_enabled_sessions.remove(session_id);
+            self.lifecycle_enabled_sessions.remove(session_id);
         }
+        if let Some(context_ids) = self.page_contexts.remove(id) {
+            for context_id in context_ids {
+                self.execution_contexts.remove(&context_id);
+                self.valid_context_ids.remove(&context_id);
+            }
+        }
+        self.page_isolated_worlds.remove(id);
         self.sessions.retain(|_, v| v != id);
+    }
+
+    fn allocate_context(
+        &mut self,
+        page_id: &str,
+        frame_id: &str,
+        origin: &str,
+        world_name: &str,
+        is_default: bool,
+    ) -> ExecutionContextRecord {
+        while self.valid_context_ids.contains(&self.next_default_context_id)
+            || self.execution_contexts.contains_key(&self.next_default_context_id)
+        {
+            self.next_default_context_id = self.next_default_context_id.checked_add(1)
+                .expect("execution context id space exhausted");
+        }
+        let id = self.next_default_context_id;
+        self.next_default_context_id = id.checked_add(1)
+            .expect("execution context id space exhausted");
+        let context = ExecutionContextRecord {
+            id,
+            unique_id: format!("obscura-context-{}", uuid::Uuid::new_v4()),
+            page_id: page_id.to_string(),
+            frame_id: frame_id.to_string(),
+            origin: origin.to_string(),
+            world_name: world_name.to_string(),
+            is_default,
+        };
+        self.valid_context_ids.insert(id);
+        self.execution_contexts.insert(id, context.clone());
+        self.page_contexts.entry(page_id.to_string()).or_default().push(id);
+        context
+    }
+
+    pub(crate) fn ensure_default_context(&mut self, page_id: &str) -> Option<ExecutionContextRecord> {
+        if let Some(context) = self.contexts_for_page(page_id).into_iter().find(|context| context.is_default) {
+            return Some(context.clone());
+        }
+        let page = self.get_page(page_id)?;
+        let frame_id = page.frame_id.clone();
+        let origin = page.url_string();
+        Some(self.allocate_context(page_id, &frame_id, &origin, "", true))
+    }
+
+    /// The single hook for an installed replacement Document.
+    pub(crate) fn commit_default_context(
+        &mut self,
+        page_id: &str,
+        frame_id: &str,
+        origin: &str,
+    ) -> Vec<ExecutionContextRecord> {
+        if let Some(previous) = self.page_contexts.remove(page_id) {
+            for id in previous {
+                self.execution_contexts.remove(&id);
+                self.valid_context_ids.remove(&id);
+            }
+        }
+        let mut contexts = vec![self.allocate_context(page_id, frame_id, origin, "", true)];
+        let mut worlds = self.isolated_worlds.clone();
+        if let Some(page_worlds) = self.page_isolated_worlds.get(page_id) {
+            for world in page_worlds {
+                if !worlds.contains(world) {
+                    worlds.push(world.clone());
+                }
+            }
+        }
+        if worlds.is_empty() {
+            worlds.push("__puppeteer_utility_world__24.40.0".to_string());
+        }
+        for world in worlds {
+            contexts.push(self.allocate_context(page_id, frame_id, origin, &world, false));
+        }
+        contexts
+    }
+
+    pub(crate) fn context_by_id(&self, id: i64) -> Option<&ExecutionContextRecord> {
+        self.execution_contexts.get(&id)
+    }
+
+    pub(crate) fn context_by_unique_id(&self, unique_id: &str) -> Option<&ExecutionContextRecord> {
+        self.execution_contexts.values().find(|context| context.unique_id == unique_id)
+    }
+
+    pub(crate) fn contexts_for_page(
+        &self,
+        page_id: &str,
+    ) -> impl Iterator<Item = &ExecutionContextRecord> {
+        self.page_contexts.get(page_id).into_iter().flatten()
+            .filter_map(|id| self.execution_contexts.get(id))
+    }
+
+    pub(crate) fn create_isolated_context(
+        &mut self,
+        page_id: &str,
+        frame_id: &str,
+        origin: &str,
+        world_name: &str,
+        persist_across_navigation: bool,
+    ) -> (ExecutionContextRecord, bool) {
+        if !world_name.is_empty() {
+            if let Some(existing) = self.contexts_for_page(page_id).find(|context| {
+                !context.is_default && context.frame_id == frame_id && context.world_name == world_name
+            }) {
+                return (existing.clone(), false);
+            }
+            if persist_across_navigation {
+                let worlds = self.page_isolated_worlds.entry(page_id.to_string()).or_default();
+                if !worlds.iter().any(|world| world == world_name) {
+                    worlds.push(world_name.to_string());
+                }
+            }
+        }
+        (self.allocate_context(page_id, frame_id, origin, world_name, false), true)
+    }
+
+    pub(crate) fn default_context_id(&self, page_id: &str) -> Option<i64> {
+        self.contexts_for_page(page_id)
+            .find(|context| context.is_default).map(|context| context.id)
+    }
+
+    fn remove_frame_contexts(
+        &mut self,
+        page_id: &str,
+        frame_id: &str,
+    ) -> Vec<ExecutionContextRecord> {
+        let removed = self.page_contexts.get(page_id).into_iter().flatten()
+            .copied()
+            .filter(|id| self.execution_contexts.get(id)
+                .is_some_and(|context| context.frame_id == frame_id))
+            .collect::<Vec<_>>();
+        if let Some(contexts) = self.page_contexts.get_mut(page_id) {
+            contexts.retain(|id| !removed.contains(id));
+        }
+        removed.into_iter().filter_map(|id| {
+            self.valid_context_ids.remove(&id);
+            self.execution_contexts.remove(&id)
+        }).collect()
+    }
+
+    pub(crate) fn runtime_sessions_for_page(&self, page_id: &str) -> Vec<String> {
+        let mut sessions = self.runtime_enabled_sessions.iter()
+            .filter(|session| self.sessions.get(*session).is_some_and(|owner| owner == page_id))
+            .cloned()
+            .collect::<Vec<_>>();
+        sessions.sort_unstable();
+        sessions
     }
 
     #[cfg(feature = "render")]
@@ -344,36 +519,139 @@ impl CdpContext {
     }
 
     pub fn get_session_page_mut(&mut self, session_id: &Option<String>) -> Option<&mut Page> {
+        // Lazily bring the target page's JS isolate live, but — unlike before —
+        // do NOT suspend the other pages. Since #756 made N concurrently-live
+        // isolates on one thread safe (every op enters its isolate only
+        // transiently, never across an `.await`), routing a command to one page
+        // no longer needs to tear down another's isolate. Tearing them down is
+        // exactly what silently destroyed a concurrent page's JS heap and
+        // object handles (#872); a page resumed here now simply stays live.
         let page_id = session_id
             .as_ref()
             .and_then(|sid| self.sessions.get(sid))
             .cloned()?;
-
-        let target_has_js = self.pages.iter().any(|p| p.id == page_id && p.has_js());
-
-        if !target_has_js {
-            for page in &mut self.pages {
-                if page.id != page_id && page.has_js() {
-                    page.suspend_js();
-                    break;
-                }
-            }
-            if let Some(target) = self.pages.iter_mut().find(|p| p.id == page_id) {
+        if let Some(target) = self.pages.iter_mut().find(|p| p.id == page_id) {
+            if !target.has_js() {
                 target.resume_js();
             }
         }
-
         self.get_page_mut(&page_id)
     }
+}
+
+#[cfg(test)]
+mod context_ownership_tests {
+    use super::*;
+
+    #[test]
+    fn repeated_page_teardown_does_not_grow_context_maps() {
+        let mut ctx = CdpContext::new();
+        for cycle in 0..64 {
+            let page_id = ctx.create_page();
+            let session_id = format!("session-{cycle}");
+            ctx.sessions.insert(session_id.clone(), page_id.clone());
+            ctx.ensure_default_context(&page_id).unwrap();
+            ctx.create_isolated_context(
+                &page_id,
+                &page_id,
+                "about:blank",
+                &format!("world-{cycle}"),
+                true,
+            );
+            ctx.remove_page(&page_id);
+
+            assert!(ctx.execution_contexts.is_empty());
+            assert!(ctx.page_contexts.is_empty());
+            assert!(ctx.page_isolated_worlds.is_empty());
+            assert!(ctx.valid_context_ids.is_empty());
+            assert!(ctx.runtime_enabled_sessions.is_empty());
+            assert!(ctx.sessions.is_empty());
+        }
+    }
+
+    #[test]
+    fn isolated_compatibility_ids_are_not_claimed_as_default_realm_routes() {
+        let mut ctx = CdpContext::new();
+        let isolated = ctx.next_isolated_context();
+
+        assert!(ctx.valid_context_ids.contains(&isolated));
+        assert!(ctx.context_by_id(isolated).is_none());
+    }
+
+    #[test]
+    fn default_and_isolated_allocators_do_not_collide_past_one_thousand_ids() {
+        let mut ctx = CdpContext::new();
+        let mut ids = HashSet::new();
+        for index in 0..1_200 {
+            let id = if index % 2 == 0 {
+                ctx.allocate_context("page", "frame", "about:blank", "", true).id
+            } else {
+                ctx.next_isolated_context()
+            };
+            assert!(ids.insert(id), "duplicate execution context id {id}");
+        }
+        assert_eq!(ids.len(), 1_200);
+    }
+
+    #[test]
+    fn repeated_document_commits_keep_only_live_page_contexts() {
+        let mut ctx = CdpContext::new();
+        let first = ctx.create_page();
+        let second = ctx.create_page();
+        ctx.ensure_default_context(&second).unwrap();
+        let sibling_id = ctx.default_context_id(&second).unwrap();
+
+        for generation in 0..64 {
+            let contexts = ctx.commit_default_context(
+                &first,
+                &first,
+                &format!("https://example.test/{generation}"),
+            );
+            assert_eq!(contexts.len(), 2);
+            assert_eq!(ctx.page_contexts[&first].len(), 2);
+            assert_eq!(ctx.execution_contexts.len(), 3);
+            assert_eq!(ctx.default_context_id(&second), Some(sibling_id));
+        }
+    }
+
+    #[test]
+    fn detached_frame_contexts_are_pruned_without_touching_siblings() {
+        let mut ctx = CdpContext::new();
+        let page = ctx.create_page();
+        let main = ctx.ensure_default_context(&page).unwrap();
+        let child = ctx.create_isolated_context(
+            &page,
+            "child-frame",
+            "https://example.test/child",
+            "utility",
+            false,
+        ).0;
+        let sibling = ctx.create_isolated_context(
+            &page,
+            "sibling-frame",
+            "https://example.test/sibling",
+            "utility",
+            false,
+        ).0;
+
+        let removed = ctx.remove_frame_contexts(&page, "child-frame");
+
+        assert_eq!(removed.iter().map(|context| context.id).collect::<Vec<_>>(), vec![child.id]);
+        assert!(ctx.context_by_id(child.id).is_none());
+        assert!(ctx.context_by_id(main.id).is_some());
+        assert!(ctx.context_by_id(sibling.id).is_some());
+    }
+
 }
 
 /// Whether a CDP method can be served WITHOUT acquiring the per-connection V8 lock.
 ///
 /// Methods listed here were audited to confirm they do not transitively
 /// call into a `JsRuntime`. They either don't touch any `Page` at all, or
-/// use only the immutable `get_session_page` accessor and Rust-side field
-/// reads. `get_session_page_mut` triggers `suspend_js`/`resume_js` and
-/// must stay behind the lock.
+/// use only page accessors plus Rust-side field reads and run no script.
+/// (As of #872 `get_session_page_mut` no longer enters V8 — it just returns
+/// the session's page — so calling it does not by itself require the lock;
+/// only a handler that actually runs JS does.)
 fn is_v8_free_method(method: &str) -> bool {
     matches!(
         method,
@@ -399,7 +677,6 @@ fn is_v8_free_method(method: &str) -> bool {
             | "Page.getFrameTree"
             | "Page.setDownloadBehavior"
             | "Page.setLifecycleEventsEnabled"
-            | "Page.addScriptToEvaluateOnNewDocument"
             | "Page.removeScriptToEvaluateOnNewDocument"
             | "Page.setInterceptFileChooserDialog"
             | "Page.getNavigationHistory"
@@ -466,8 +743,8 @@ pub async fn dispatch(req: &CdpRequest, ctx: &mut CdpContext) -> CdpResponse {
     // Optimization: methods that demonstrably never touch V8 bypass the lock
     // (Puppeteer's newPage() setup issues ~8 such calls). Each listed method was
     // audited to confirm it never reaches `JsRuntime::execute_script` or DOM
-    // mutation that re-enters V8; `get_session_page_mut` (which can trigger
-    // `suspend_js`/`resume_js`) is NOT in the list.
+    // mutation that re-enters V8. (`get_session_page_mut` itself no longer
+    // enters V8 as of #872, so calling it is not what gates a method here.)
     let _v8_guard = if is_v8_free_method(&req.method) {
         None
     } else {
@@ -531,6 +808,15 @@ pub async fn dispatch(req: &CdpRequest, ctx: &mut CdpContext) -> CdpResponse {
         "Accessibility" => {
             domains::accessibility::handle(method, &req.params, ctx, &req.session_id).await
         }
+        "HeapProfiler" if method == "collectGarbage" => {
+            match ctx.get_session_page_mut(&req.session_id).and_then(|page| page.js.as_mut()) {
+                Some(js) => {
+                    js.collect_garbage();
+                    Ok(json!({}))
+                }
+                None => Err("No JavaScript runtime".to_string()),
+            }
+        }
         // Accepted but no-op. Puppeteer's FrameManager.initialize calls
         // Audits.enable on connect — refusing it breaks puppeteer.connect()
         // before any user code runs.
@@ -540,13 +826,10 @@ pub async fn dispatch(req: &CdpRequest, ctx: &mut CdpContext) -> CdpResponse {
     };
 
     #[cfg(feature = "render")]
-    if result.is_ok() && domains::page::command_can_change_screencast_frame(&req.method) {
-        if let Err(error) = domains::page::queue_screencast_frame(ctx, &req.session_id, false) {
-            // Frame delivery is an asynchronous side effect in Chromium; it
-            // must not rewrite an otherwise successful command response.
-            tracing::warn!(method = %req.method,
-                "could not produce command-driven screencast frame: {error}");
-        }
+    if result.is_ok()
+        && domains::page::command_can_change_screencast_frame(&req.method)
+    {
+        domains::page::schedule_screencast_frame(ctx, &req.session_id);
     }
 
     // Stop the per-command watchdog. If it fired (the handler held V8 past the
@@ -579,8 +862,19 @@ pub async fn dispatch(req: &CdpRequest, ctx: &mut CdpContext) -> CdpResponse {
 }
 
 pub(crate) fn drain_runtime_events(ctx: &mut CdpContext) {
+    let mut drained = Vec::new();
+    for page in &mut ctx.pages {
+        let runtime_events = page.take_pending_runtime_events();
+        if !runtime_events.is_empty() {
+            drained.push((page.id.clone(), runtime_events));
+        }
+    }
+    if drained.is_empty() {
+        return;
+    }
+
     let mut page_to_sessions: HashMap<&str, Vec<&str>> = HashMap::new();
-    for session_id in &ctx.runtime_enabled_sessions {
+    for session_id in ctx.runtime_enabled_sessions.union(&ctx.lifecycle_enabled_sessions) {
         if let Some(page_id) = ctx.sessions.get(session_id) {
             page_to_sessions
                 .entry(page_id.as_str())
@@ -591,28 +885,32 @@ pub(crate) fn drain_runtime_events(ctx: &mut CdpContext) {
     for sessions in page_to_sessions.values_mut() {
         sessions.sort_unstable();
     }
-
     let mut events = Vec::new();
-    for page in &mut ctx.pages {
-        let runtime_events = page.take_pending_runtime_events();
-        if runtime_events.is_empty() {
-            continue;
-        }
-        let Some(sessions) = page_to_sessions.get(page.id.as_str()) else {
+    for (page_id, runtime_events) in drained {
+        let Some(sessions) = page_to_sessions.get(page_id.as_str()) else {
             continue;
         };
-        let execution_context_id = if ctx
-            .current_loader_ids
-            .get(&page.id)
-            .is_some_and(|loader_id| loader_id.starts_with("loader-blank-"))
-        {
-            1
-        } else {
-            2
-        };
+        let execution_context_id = ctx.default_context_id(&page_id).unwrap_or(1);
         for runtime_event in runtime_events {
+            let subscribers = if matches!(&runtime_event, obscura_js::ops::RuntimeEvent::DocumentLifecycle { .. }) {
+                &ctx.lifecycle_enabled_sessions
+            } else {
+                &ctx.runtime_enabled_sessions
+            };
             for session_id in sessions {
+                if !subscribers.contains(*session_id) {
+                    continue;
+                }
                 let (method, params) = match &runtime_event {
+                    obscura_js::ops::RuntimeEvent::DocumentLifecycle { name, timestamp } => (
+                        "Page.lifecycleEvent",
+                        json!({
+                            "frameId": ctx.pages.iter().find(|page| page.id == page_id).map(|page| &page.frame_id),
+                            "loaderId": ctx.current_loader_ids.get(&page_id),
+                            "name": name,
+                            "timestamp": timestamp,
+                        }),
+                    ),
                     obscura_js::ops::RuntimeEvent::Console(event) => (
                         "Runtime.consoleAPICalled",
                         json!({
@@ -663,6 +961,17 @@ pub(crate) fn drain_runtime_events(ctx: &mut CdpContext) {
 // in the queue while V8 is running inside a CDP handler, so there is no
 // window in which they could pile up without a draining opportunity.
 pub(crate) fn drain_binding_calls(ctx: &mut CdpContext) {
+    let mut drained = Vec::new();
+    for page in &mut ctx.pages {
+        let calls = page.take_pending_binding_calls();
+        if !calls.is_empty() {
+            drained.push((page.id.clone(), calls));
+        }
+    }
+    if drained.is_empty() {
+        return;
+    }
+
     // page_id -> every session on that page. A page commonly has more than one:
     // Target.createTarget opens a session and the Target.attachToTarget that
     // follows opens another, so a client that reaches a page the ordinary way
@@ -678,18 +987,14 @@ pub(crate) fn drain_binding_calls(ctx: &mut CdpContext) {
     for sessions in page_to_sessions.values_mut() {
         sessions.sort_unstable();
     }
-
     let mut events: Vec<CdpEvent> = Vec::new();
-    for page in &mut ctx.pages {
-        let calls = page.take_pending_binding_calls();
-        if calls.is_empty() {
-            continue;
-        }
-        let Some(page_sessions) = page_to_sessions.get(page.id.as_str()) else {
+    for (page_id, calls) in drained {
+        let Some(page_sessions) = page_to_sessions.get(page_id.as_str()) else {
             // No session attached — drop the calls; there is no client to
             // deliver them to.
             continue;
         };
+        let execution_context_id = ctx.default_context_id(&page_id).unwrap_or(1);
         for (name, payload) in calls {
             // The sessions that asked for this binding, narrowed to the page the
             // call came from. Falling back to every session of the page keeps a
@@ -711,14 +1016,10 @@ pub(crate) fn drain_binding_calls(ctx: &mut CdpContext) {
             for session_id in targets {
                 events.push(CdpEvent {
                     method: "Runtime.bindingCalled".into(),
-                    // Use executionContextId=2: the default main-frame context
-                    // emitted post-navigation (see domains/page.rs phase1).
-                    // Puppeteer matches on session_id + binding name and
-                    // tolerates any registered context id.
                     params: json!({
                         "name": name,
                         "payload": payload,
-                        "executionContextId": 2,
+                        "executionContextId": execution_context_id,
                     }),
                     session_id: Some(session_id.to_string()),
                 });
@@ -756,6 +1057,7 @@ pub(crate) fn drain_frame_events(ctx: &mut CdpContext) {
 
     let mut events: Vec<CdpEvent> = Vec::new();
     let mut announced: HashMap<String, Vec<String>> = HashMap::new();
+    let mut detached = Vec::new();
     for page in &ctx.pages {
         let Some(session_ids) = page_to_sessions.get(&page.id) else {
             continue;
@@ -802,17 +1104,34 @@ pub(crate) fn drain_frame_events(ctx: &mut CdpContext) {
         if let Some(known) = known {
             for id in known {
                 if !live_ids.contains(id) {
-                    for session_id in session_ids {
-                        events.push(CdpEvent {
-                            method: "Page.frameDetached".into(),
-                            params: json!({ "frameId": id, "reason": "remove" }),
-                            session_id: Some(session_id.clone()),
-                        });
-                    }
+                    detached.push((page.id.clone(), id.clone(), session_ids.clone()));
                 }
             }
         }
         announced.insert(page.id.clone(), live_ids);
+    }
+    for (page_id, frame_id, page_sessions) in detached {
+        let removed = ctx.remove_frame_contexts(&page_id, &frame_id);
+        let runtime_sessions = ctx.runtime_sessions_for_page(&page_id);
+        for context in removed {
+            for session_id in &runtime_sessions {
+                events.push(CdpEvent::with_session(
+                    "Runtime.executionContextDestroyed",
+                    json!({
+                        "executionContextId": context.id,
+                        "executionContextUniqueId": context.unique_id,
+                    }),
+                    session_id.clone(),
+                ));
+            }
+        }
+        for session_id in page_sessions {
+            events.push(CdpEvent {
+                method: "Page.frameDetached".into(),
+                params: json!({ "frameId": frame_id, "reason": "remove" }),
+                session_id: Some(session_id),
+            });
+        }
     }
     ctx.announced_frames.extend(announced);
     ctx.pending_events.extend(events);
@@ -889,6 +1208,29 @@ mod tests {
         }
     }
 
+    #[tokio::test(flavor = "current_thread")]
+    async fn heap_profiler_collect_garbage_reclaims_unreferenced_objects() {
+        let mut ctx = CdpContext::new();
+        let page_id = ctx.create_page();
+        let session = Some("heap-gc".to_string());
+        ctx.sessions.insert(session.clone().unwrap(), page_id);
+        ctx.get_session_page_mut(&session).unwrap().js.as_mut().unwrap().execute_script("gc-allocations",
+            "globalThis.garbage = Array.from({length: 200000}, (_, i) => ({i}));",
+        ).unwrap();
+        let before = domains::runtime::handle("getHeapUsage", &json!({}), &mut ctx, &session)
+            .await.unwrap()["usedSize"].as_u64().unwrap();
+        ctx.get_session_page_mut(&session).unwrap().evaluate("globalThis.garbage = null");
+        let response = dispatch(&CdpRequest {
+            session_id: session.clone(),
+            ..req("HeapProfiler.collectGarbage")
+        }, &mut ctx).await;
+        assert!(response.error.is_none(), "GC request failed: {:?}", response.error);
+        let after = domains::runtime::handle("getHeapUsage", &json!({}), &mut ctx, &session)
+            .await.unwrap()["usedSize"].as_u64().unwrap();
+        assert!(after + 2 * 1024 * 1024 < before,
+            "explicit GC must reclaim discarded objects: {before} -> {after}");
+    }
+
     #[tokio::test]
     async fn audits_enable_returns_empty_success() {
         let mut ctx = CdpContext::new();
@@ -908,6 +1250,83 @@ mod tests {
         let err = resp.error.expect("unknown domain must surface as error");
         assert_eq!(err.code, -32601);
         assert!(err.message.contains("Unknown domain"));
+    }
+
+    #[cfg(feature = "render")]
+    #[tokio::test(flavor = "current_thread")]
+    async fn read_only_runtime_calls_do_not_force_screencast_frames() {
+        let mut ctx = CdpContext::new();
+        let page_id = ctx.create_page();
+        let session_id = format!("{page_id}-session");
+        ctx.sessions.insert(session_id.clone(), page_id);
+
+        let start = CdpRequest {
+            id: 2,
+            method: "Page.startScreencast".into(),
+            params: json!({}),
+            session_id: Some(session_id.clone()),
+        };
+        let response = dispatch(&start, &mut ctx).await;
+        assert!(response.error.is_none(), "start failed: {:?}", response.error);
+        ctx.pending_events.clear();
+
+        let evaluate = CdpRequest {
+            id: 3,
+            method: "Runtime.evaluate".into(),
+            params: json!({"expression": "document.title", "returnByValue": true}),
+            session_id: Some(session_id),
+        };
+        let response = dispatch(&evaluate, &mut ctx).await;
+        assert!(response.error.is_none(), "evaluate failed: {:?}", response.error);
+        assert!(
+            ctx.pending_events
+                .iter()
+                .all(|event| event.method != "Page.screencastFrame"),
+            "a read-only runtime call must not synchronously rasterize a frame"
+        );
+    }
+
+    #[cfg(feature = "render")]
+    #[tokio::test(flavor = "current_thread")]
+    async fn mutating_commands_schedule_screencast_after_the_command_response() {
+        let mut ctx = CdpContext::new();
+        let page_id = ctx.create_page();
+        let session_id = format!("{page_id}-session");
+        ctx.sessions.insert(session_id.clone(), page_id);
+        let session = Some(session_id.clone());
+
+        let response = dispatch(
+            &CdpRequest {
+                id: 2,
+                method: "Page.startScreencast".into(),
+                params: json!({}),
+                session_id: session.clone(),
+            },
+            &mut ctx,
+        )
+        .await;
+        assert!(response.error.is_none(), "start failed: {:?}", response.error);
+        ctx.pending_events.clear();
+
+        let response = dispatch(
+            &CdpRequest {
+                id: 3,
+                method: "Emulation.setDefaultBackgroundColorOverride".into(),
+                params: json!({"color": {"r": 20, "g": 40, "b": 60}}),
+                session_id: session.clone(),
+            },
+            &mut ctx,
+        )
+        .await;
+        assert!(response.error.is_none(), "override failed: {:?}", response.error);
+        assert!(ctx.pending_events.is_empty(), "frame must not delay the command response");
+        assert!(ctx.screencasts[&session_id].autonomous_frame_pending);
+
+        crate::domains::page::pump_screencast_frames(&mut ctx).await;
+        assert!(ctx
+            .pending_events
+            .iter()
+            .any(|event| event.method == "Page.screencastFrame"));
     }
 
     #[tokio::test]
@@ -975,4 +1394,5 @@ mod tests {
         let err = resp.error.expect("malformed inner messages must error");
         assert_eq!(err.code, -32700);
     }
+
 }

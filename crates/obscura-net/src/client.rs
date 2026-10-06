@@ -12,7 +12,7 @@ use reqwest::{Client, Method};
 use tokio::sync::{RwLock, watch};
 use url::Url;
 
-use crate::cookies::CookieJar;
+use crate::cookies::{same_site, CookieJar, SameSiteContext};
 use crate::interceptor::{InterceptAction, RequestInterceptor};
 
 fn configured_root_paths() -> Vec<std::path::PathBuf> {
@@ -114,6 +114,28 @@ impl Response {
             .map(|ct| ct.contains("text/html"))
             .unwrap_or(false)
     }
+}
+
+/// Fold one response header line into the collected header map.
+///
+/// A plain `HashMap` insert keeps only the *last* value when a response repeats
+/// a header name (`Link`, `Via`, `WWW-Authenticate`, ...), silently dropping the
+/// earlier lines. Per RFC 9110 §5.3 duplicate field lines of the same name may
+/// be combined into one comma-separated value without changing semantics.
+/// `Set-Cookie` is the exception (RFC 6265 forbids folding it): it is captured
+/// individually by the cookie jar via `get_all`, so the map keeps it only as a
+/// presence signal and last-wins there is fine.
+pub(crate) fn merge_response_header(map: &mut HashMap<String, String>, name: String, value: String) {
+    if name == "set-cookie" {
+        map.insert(name, value);
+        return;
+    }
+    map.entry(name)
+        .and_modify(|existing| {
+            existing.push_str(", ");
+            existing.push_str(&value);
+        })
+        .or_insert(value);
 }
 
 #[derive(Debug, Clone)]
@@ -242,7 +264,13 @@ impl ResourceRequest {
             referrer: Some(referrer.clone()),
             mode: RequestMode::Cors,
             credentials: RequestCredentials::SameOrigin,
-            max_response_bytes: 32 * 1024 * 1024,
+            // OBSCURA_FETCH_MAX_BODY_BYTES (the fetch()/XHR override from #581)
+            // also raises this cap: a large SPA bundle otherwise dies silently
+            // at 32 MiB while fetch() of the same URL succeeds (#849).
+            max_response_bytes: std::env::var("OBSCURA_FETCH_MAX_BODY_BYTES")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(32 * 1024 * 1024),
         }
     }
 
@@ -421,6 +449,23 @@ pub(crate) fn request_fetch_site(request: &ResourceRequest, target: &Url) -> &'s
     }
 }
 
+pub(crate) fn same_site_context(
+    request: &ResourceRequest,
+    target: &Url,
+    method_is_safe: bool,
+) -> SameSiteContext {
+    let Some(initiator) = request.initiator.as_ref() else {
+        return SameSiteContext::SameSite;
+    };
+    if same_site(initiator, target) {
+        SameSiteContext::SameSite
+    } else if request.mode == RequestMode::Navigate && method_is_safe {
+        SameSiteContext::CrossSiteTopLevelSafe
+    } else {
+        SameSiteContext::CrossSite
+    }
+}
+
 pub(crate) fn request_referrer(request: &ResourceRequest, target: &Url) -> Option<String> {
     let source = request
         .referrer
@@ -547,57 +592,7 @@ impl Default for CallbackRegistry {
     }
 }
 
-/// Process-wide opt-in via env var. Older flow that issue #4 introduced. The
-/// new `--allow-private-network` CLI flag (issue #33) sets a per-client field
-/// that is OR'd with this so existing scripts and Docker setups that pin the
-/// env var keep working unchanged.
-pub fn env_allows_private_network() -> bool {
-    matches!(
-        std::env::var("OBSCURA_ALLOW_PRIVATE_NETWORK")
-            .ok()
-            .as_deref()
-            .map(str::trim)
-            .map(str::to_ascii_lowercase)
-            .as_deref(),
-        Some("1") | Some("true") | Some("yes") | Some("on")
-    )
-}
-
-/// True when `ip` must never be the target of an outbound request from the
-/// engine: loopback, RFC1918 private, link-local (incl. the 169.254.169.254
-/// cloud-metadata endpoint), broadcast, documentation, the unspecified address
-/// (0.0.0.0 / ::, which the OS routes to localhost), IPv6 unique-local
-/// (fc00::/7), and any IPv4-mapped/compatible IPv6 form of the above.
-/// Centralizes the SSRF deny-set so the literal-host check and the
-/// DNS-resolution check (`SsrfGuardResolver`) can never disagree.
-pub fn is_forbidden_ip(ip: IpAddr) -> bool {
-    match ip {
-        IpAddr::V4(v4) => {
-            v4.is_loopback()
-                || v4.is_private()
-                || v4.is_link_local()
-                || v4.is_broadcast()
-                || v4.is_documentation()
-                || v4.is_unspecified()
-        }
-        IpAddr::V6(v6) => {
-            if v6.is_loopback()
-                || v6.is_unspecified()
-                || v6.is_unique_local()
-                || v6.is_unicast_link_local()
-            {
-                return true;
-            }
-            // Unwrap IPv4-mapped (::ffff:a.b.c.d) and IPv4-compatible (::a.b.c.d)
-            // forms and re-check the embedded v4 so e.g. [::ffff:127.0.0.1] or
-            // [::ffff:169.254.169.254] cannot slip past the v6 arm.
-            if let Some(v4) = v6.to_ipv4_mapped().or_else(|| v6.to_ipv4()) {
-                return is_forbidden_ip(IpAddr::V4(v4));
-            }
-            false
-        }
-    }
-}
+pub use obscura_ssrf::{env_allows_private_network, is_forbidden_ip};
 
 /// DNS resolver that performs the lookup and then rejects the whole request if
 /// ANY resolved address is in the SSRF deny-set. This closes the DNS-rebinding
@@ -677,6 +672,11 @@ pub(crate) fn validate_url(url: &Url, allow_private_network: bool) -> Result<(),
                     )));
                 }
             }
+            // Octal, hex, decimal and overlong IPv4 spellings ("0x7f000001",
+            // "0177.0.0.1", "2130706433") never reach this arm: for the http
+            // and https schemes the url crate normalizes them to Host::Ipv4,
+            // which is checked above. This arm is a belt-and-braces check on
+            // names, and the resolver re-checks whatever the name resolves to.
             url::Host::Domain(domain) => {
                 let lower_domain = domain.to_lowercase();
                 if lower_domain == "localhost"
@@ -1070,6 +1070,9 @@ impl ObscuraHttpClient {
                 .redirect(Policy::none())
                 .timeout(self.timeout)
                 .danger_accept_invalid_certs(false)
+                // Read a folded header line (obs-fold) as browsers do instead of
+                // failing the response.
+                .http1_allow_obsolete_multiline_headers_in_responses(true)
                 // SSRF guard: reject hostnames that resolve to a private/loopback IP.
                 .dns_resolver(Arc::new(SsrfGuardResolver::new(self.allow_private_network)))
 ;
@@ -1202,7 +1205,12 @@ impl ObscuraHttpClient {
         }) {
             return None;
         }
-        if request.sends_credentials_to(url) && !self.cookie_jar.get_cookie_header(url).is_empty() {
+        if request.sends_credentials_to(url)
+            && !self
+                .cookie_jar
+                .get_cookie_header_in_context(url, SameSiteContext::SameSite)
+                .is_empty()
+        {
             return None;
         }
         Some(ResourceCacheKey {
@@ -1396,11 +1404,16 @@ impl ObscuraHttpClient {
 
         let mut current_url = url.clone();
         let mut redirects = Vec::new();
+        // Follow up to 20 redirects, matching the Fetch spec and the fetch()/XHR
+        // path in obscura-js. `0..=max_redirects` makes max_redirects+1 requests
+        // (the initial one plus 20 hops), so the 20th redirect is still followed
+        // and only the 21st fails. The old `0..max_redirects` made 20 requests
+        // total and thus followed only 19 (WPT redirect-count: 20 must pass).
         let max_redirects = 20;
         let mut redirect_tainted = false;
         let mut request_callback_fired = false;
 
-        for _redirect_count in 0..max_redirects {
+        for _redirect_count in 0..=max_redirects {
             validate_request_mode(&request, &current_url)?;
             let request_info = RequestInfo {
                 url: current_url.clone(),
@@ -1488,7 +1501,14 @@ impl ObscuraHttpClient {
             }
 
             let cookie_header = if request.sends_credentials_to(&current_url) {
-                self.cookie_jar.get_cookie_header(&current_url)
+                self.cookie_jar.get_cookie_header_in_context(
+                    &current_url,
+                    same_site_context(
+                        &request,
+                        &current_url,
+                        matches!(method, Method::GET | Method::HEAD),
+                    ),
+                )
             } else {
                 String::new()
             };
@@ -1574,11 +1594,14 @@ impl ObscuraHttpClient {
                 }
             }
 
-            let response_headers: HashMap<String, String> = resp
-                .headers()
-                .iter()
-                .map(|(k, v)| (k.as_str().to_lowercase(), v.to_str().unwrap_or("").to_string()))
-                .collect();
+            let mut response_headers: HashMap<String, String> = HashMap::new();
+            for (k, v) in resp.headers().iter() {
+                merge_response_header(
+                    &mut response_headers,
+                    k.as_str().to_lowercase(),
+                    v.to_str().unwrap_or("").to_string(),
+                );
+            }
 
             if status.is_redirection() {
                 if let Some(location) = resp.headers().get(reqwest::header::LOCATION) {
@@ -1679,7 +1702,7 @@ pub enum ObscuraNetError {
 #[cfg(test)]
 mod ssrf_tests {
     use super::{
-        is_forbidden_ip, request_fetch_site, request_referrer, validate_url,
+        is_forbidden_ip, merge_response_header, request_fetch_site, request_referrer, validate_url,
         CallbackRegistry, ObscuraHttpClient, ObscuraNetError, RequestCredentials, RequestMode,
         ResourceRequest, ResourceType, SsrfGuardResolver,
     };
@@ -1695,6 +1718,34 @@ mod ssrf_tests {
 
     fn ip(s: &str) -> IpAddr {
         IpAddr::from_str(s).unwrap()
+    }
+
+    // A response that repeats a header name (Link, Via, WWW-Authenticate, ...)
+    // must not lose all but the last line. See #913.
+    #[test]
+    fn response_headers_preserve_duplicate_values() {
+        let mut headers = HashMap::new();
+        merge_response_header(&mut headers, "link".into(), "<a>; rel=preload".into());
+        merge_response_header(&mut headers, "link".into(), "<b>; rel=preconnect".into());
+        assert_eq!(
+            headers.get("link").map(String::as_str),
+            Some("<a>; rel=preload, <b>; rel=preconnect"),
+            "duplicate header lines must be combined per RFC 9110, not dropped"
+        );
+    }
+
+    // Set-Cookie must not be comma-folded (RFC 6265); the cookie jar captures
+    // each line via get_all, so the map keeps it only as a presence signal.
+    #[test]
+    fn response_headers_do_not_fold_set_cookie() {
+        let mut headers = HashMap::new();
+        merge_response_header(&mut headers, "set-cookie".into(), "a=1".into());
+        merge_response_header(&mut headers, "set-cookie".into(), "b=2".into());
+        assert_eq!(
+            headers.get("set-cookie").map(String::as_str),
+            Some("b=2"),
+            "Set-Cookie must stay a single (last) value, never comma-folded"
+        );
     }
 
     #[test]
@@ -1721,6 +1772,67 @@ mod ssrf_tests {
         }
     }
 
+    // SEC-401 / #810 — std's is_private() only covers RFC1918, so CGNAT and
+    // other IANA special-purpose ranges (which host cloud metadata) must be
+    // blocked explicitly, including their IPv4-mapped IPv6 forms.
+    #[test]
+    fn ipv4_cgnat_and_iana_special_ranges_are_forbidden() {
+        for s in [
+            "100.64.0.1",             // CGNAT / RFC 6598 start
+            "100.100.100.200",        // Alibaba Cloud metadata (CGNAT)
+            "100.127.255.255",        // CGNAT end
+            "198.18.0.1",             // benchmarking / RFC 2544 start
+            "198.19.255.255",         // benchmarking end
+            "192.88.99.1",            // 6to4 relay anycast / RFC 7526
+            "::ffff:100.100.100.200", // v4-mapped CGNAT
+        ] {
+            assert!(is_forbidden_ip(ip(s)), "{s} should be forbidden");
+        }
+    }
+
+    // Addresses just outside those prefixes must stay allowed (no over-block).
+    #[test]
+    fn ipv4_addresses_adjacent_to_special_ranges_stay_allowed() {
+        for s in [
+            "100.63.255.255", // just below 100.64.0.0/10
+            "100.128.0.0",    // just above 100.127.255.255
+            "198.17.255.255", // just below 198.18.0.0/15
+            "198.20.0.0",     // just above 198.19.255.255
+            "192.88.98.255",  // just below 192.88.99.0/24
+            "192.88.100.0",   // just above 192.88.99.0/24
+        ] {
+            assert!(!is_forbidden_ip(ip(s)), "{s} should be allowed");
+        }
+    }
+
+    #[test]
+    fn remaining_non_global_ipv4_ranges_are_forbidden_without_blocking_exceptions() {
+        for s in [
+            "0.1.2.3",
+            "192.0.0.8",
+            "192.0.0.192",
+            "224.0.0.1",
+            "239.255.255.255",
+            "240.0.0.1",
+            "255.255.255.254",
+        ] {
+            assert!(is_forbidden_ip(ip(s)), "{s} should be forbidden");
+        }
+
+        // IANA marks these specific protocol anycast addresses and these
+        // special-purpose /24s globally reachable. Blocking them would be a
+        // network compatibility regression, not an SSRF hardening win.
+        for s in [
+            "192.0.0.9",
+            "192.0.0.10",
+            "192.31.196.1",
+            "192.52.193.1",
+            "192.175.48.1",
+        ] {
+            assert!(!is_forbidden_ip(ip(s)), "{s} should be allowed");
+        }
+    }
+
     #[test]
     fn ipv6_loopback_ula_linklocal_and_mapped_are_forbidden() {
         for s in [
@@ -1738,7 +1850,60 @@ mod ssrf_tests {
 
     #[test]
     fn public_ipv6_is_allowed() {
-        assert!(!is_forbidden_ip(ip("2606:4700:4700::1111"))); // cloudflare dns
+        for s in [
+            "2606:4700:4700::1111", // Cloudflare DNS
+            "3ffe::1",               // below 3fff::/20
+            "3fff:1000::1",          // above 3fff:fff::/20
+        ] {
+            assert!(!is_forbidden_ip(ip(s)), "{s} should be allowed");
+        }
+    }
+
+    #[test]
+    fn ipv6_translation_cannot_hide_forbidden_ipv4() {
+        for s in [
+            "2002:7f00:1::",       // 6to4 loopback
+            "2002:a9fe:a9fe::",    // 6to4 link-local metadata
+            "2002:6464:64c8::",    // 6to4 CGNAT metadata
+            "64:ff9b::7f00:1",     // NAT64 loopback
+            "64:ff9b::a9fe:a9fe",  // NAT64 link-local metadata
+            "64:ff9b::6464:64c8",  // NAT64 CGNAT metadata
+            "64:ff9b:1::1",        // local-use translation prefix
+        ] {
+            assert!(is_forbidden_ip(ip(s)), "{s} should be forbidden");
+        }
+
+        for s in ["2002:808:808::", "64:ff9b::808:808"] {
+            assert!(!is_forbidden_ip(ip(s)), "{s} should be allowed");
+        }
+    }
+
+    #[test]
+    fn teredo_cannot_hide_a_forbidden_ipv4() {
+        // RFC 4380: 2001:0::/32 embeds the Teredo server's IPv4 in bits
+        // 32..64 and the client's public IPv4, bit-inverted, in the last 32
+        // bits. Both are IPv4-in-IPv6 forms like NAT64 and 6to4.
+        // Client 127.1.1.1 (inverted 80fe:fefe) behind server 65.54.227.120.
+        assert!(is_forbidden_ip(ip("2001:0:4136:e378:8000:63bf:80fe:fefe")));
+        // Client 10.0.0.1 (inverted f5ff:fffe).
+        assert!(is_forbidden_ip(ip("2001:0:4136:e378:8000:63bf:f5ff:fffe")));
+        // Server 10.0.0.1 with a public client.
+        assert!(is_forbidden_ip(ip("2001:0:a00:1:8000:63bf:f7f7:f7f7")));
+        // Public server and public client 8.8.8.8 (inverted f7f7:f7f7).
+        assert!(!is_forbidden_ip(ip("2001:0:4136:e378:8000:63bf:f7f7:f7f7")));
+    }
+
+    #[test]
+    fn native_non_global_ipv6_ranges_are_forbidden() {
+        for s in [
+            "100::1",       // discard-only
+            "2001:db8::1",  // documentation
+            "3fff::1",      // documentation
+            "ff02::1",      // link-local multicast
+            "ff0e::1",      // global-scope multicast
+        ] {
+            assert!(is_forbidden_ip(ip(s)), "{s} should be forbidden");
+        }
     }
 
     #[test]
@@ -1747,6 +1912,16 @@ mod ssrf_tests {
         assert!(validate_url(&Url::parse("http://0.0.0.0:8080/").unwrap(), false).is_err());
         assert!(validate_url(&Url::parse("http://127.0.0.1/").unwrap(), false).is_err());
         assert!(validate_url(&Url::parse("http://example.com/").unwrap(), false).is_ok());
+        assert!(
+            validate_url(&Url::parse("http://[64:ff9b::7f00:1]/").unwrap(), false).is_err()
+        );
+        assert!(
+            validate_url(&Url::parse("http://[2002:a9fe:a9fe::]/").unwrap(), false).is_err()
+        );
+        assert!(validate_url(&Url::parse("http://192.0.0.9/").unwrap(), false).is_ok());
+        assert!(
+            validate_url(&Url::parse("http://[64:ff9b::808:808]/").unwrap(), false).is_ok()
+        );
         // The allow flag bypasses the guard (local-dev escape hatch).
         assert!(validate_url(&Url::parse("http://127.0.0.1/").unwrap(), true).is_ok());
     }
@@ -1860,6 +2035,53 @@ mod ssrf_tests {
         )
     }
 
+    fn redirect_to_self() -> String {
+        "HTTP/1.1 302 Found\r\nLocation: /resource\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+            .to_string()
+    }
+
+    // Browsers read a folded header line (obs-fold, RFC 9112 5.2) as part of
+    // the line above. Some origins still fold long values: promodirect.com
+    // sends its Content-Security-Policy over several lines, each continuation
+    // after a bare LF and two spaces. httparse rejects the whole response
+    // unless obs-fold is allowed.
+    #[tokio::test]
+    async fn navigation_accepts_a_folded_response_header() {
+        let folded = "Content-Security-Policy: default-src 'self'\n  https://a.example\n  https://b.example\r\n";
+        let (target, _rx) = http_fixture(vec![ok_response(folded, "folded")]).await;
+        let client = ObscuraHttpClient::with_full_options(Arc::new(CookieJar::new()), None, true);
+        let response = client
+            .fetch(&target)
+            .await
+            .expect("a folded header must not fail the response");
+        assert_eq!(response.body, b"folded");
+    }
+
+    // WPT fetch/api/redirect/redirect-count: the 20th redirect must still be
+    // followed, the 21st must fail. Guards the `0..=max_redirects` boundary in
+    // fetch_with_profile_uncached; `0..max_redirects` regressed this to 19.
+    #[tokio::test]
+    async fn navigation_follows_twenty_redirects_but_not_twenty_one() {
+        let mut pass: Vec<String> = (0..20).map(|_| redirect_to_self()).collect();
+        pass.push(ok_response("", "arrived"));
+        let (target, _rx) = http_fixture(pass).await;
+        let client = ObscuraHttpClient::with_full_options(Arc::new(CookieJar::new()), None, true);
+        let response = client
+            .fetch(&target)
+            .await
+            .expect("the 20th redirect must be followed");
+        assert_eq!(response.body, b"arrived");
+
+        let fail: Vec<String> = (0..21).map(|_| redirect_to_self()).collect();
+        let (target, _rx) = http_fixture(fail).await;
+        let client = ObscuraHttpClient::with_full_options(Arc::new(CookieJar::new()), None, true);
+        let err = client
+            .fetch(&target)
+            .await
+            .expect_err("the 21st redirect must be too many");
+        assert!(matches!(err, ObscuraNetError::TooManyRedirects(_)), "got {err:?}");
+    }
+
     #[tokio::test]
     async fn cross_origin_font_sends_origin_and_omits_cross_origin_cookies() {
         let (target, mut received) = http_fixture(vec![ok_response(
@@ -1886,7 +2108,38 @@ mod ssrf_tests {
         assert!(request.contains("sec-fetch-mode: cors\r\n"));
         assert!(request.contains("sec-fetch-dest: font\r\n"));
         assert!(!request.contains("cookie:"));
-        assert_eq!(jar.get_cookie_header(&target), "seed=1");
+        assert_eq!(jar.get_cookie_header_same_site(&target), "seed=1");
+    }
+
+    // #849 — the OBSCURA_FETCH_MAX_BODY_BYTES override #581 gave fetch()/XHR
+    // must also reach the module-script cap; a large SPA bundle otherwise dies
+    // silently at a hardcoded 32 MiB while fetch() of the same URL succeeds.
+    // (nextest runs each test in its own process, so set_var cannot race.)
+    #[test]
+    fn module_script_cap_honours_the_fetch_body_env_override() {
+        let u = Url::parse("https://example.com/app.mjs").unwrap();
+
+        std::env::remove_var("OBSCURA_FETCH_MAX_BODY_BYTES");
+        assert_eq!(
+            ResourceRequest::module_script(&u, &u).max_response_bytes,
+            32 * 1024 * 1024,
+            "default module cap stays 32 MiB"
+        );
+
+        std::env::set_var("OBSCURA_FETCH_MAX_BODY_BYTES", "134217728");
+        assert_eq!(
+            ResourceRequest::module_script(&u, &u).max_response_bytes,
+            128 * 1024 * 1024,
+            "the env override must reach the module-script cap"
+        );
+
+        // Garbage stays on the default rather than panicking.
+        std::env::set_var("OBSCURA_FETCH_MAX_BODY_BYTES", "not-a-number");
+        assert_eq!(
+            ResourceRequest::module_script(&u, &u).max_response_bytes,
+            32 * 1024 * 1024,
+        );
+        std::env::remove_var("OBSCURA_FETCH_MAX_BODY_BYTES");
     }
 
     #[tokio::test]
@@ -1917,7 +2170,7 @@ mod ssrf_tests {
         assert!(request.contains("sec-fetch-dest: script\r\n"));
         assert!(request.contains(&format!("referer: {}\r\n", importing_module)));
         assert!(!request.contains("cookie:"));
-        assert_eq!(jar.get_cookie_header(&target), "seed=1");
+        assert_eq!(jar.get_cookie_header_same_site(&target), "seed=1");
     }
 
     #[tokio::test]
@@ -1953,7 +2206,7 @@ mod ssrf_tests {
         let second = received.recv().await.unwrap().to_ascii_lowercase();
         assert!(first.contains("cookie: seed=1\r\n"));
         assert!(second.contains("cookie: seed=1\r\n"));
-        let cookies = jar.get_cookie_header(&target);
+        let cookies = jar.get_cookie_header_same_site(&target);
         assert!(cookies.contains("seed=1"));
         assert!(cookies.contains("accepted=1"));
     }

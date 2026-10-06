@@ -104,6 +104,117 @@ async fn dispatch_key_event_escapes_backslash_in_key_and_code() {
     );
 }
 
+#[tokio::test(flavor = "current_thread")]
+async fn dispatch_key_event_exposes_legacy_virtual_key_codes() {
+    std::env::set_var("OBSCURA_ALLOW_PRIVATE_NETWORK", "1");
+    let url = serve_page().await;
+    let mut ctx = CdpContext::new();
+    let page_id = ctx.create_page();
+    let session_id = "session-1";
+    ctx.sessions.insert(session_id.to_string(), page_id);
+
+    cdp(&mut ctx, 1, "Page.navigate", json!({"url": url, "waitUntil": "load"}), session_id).await;
+    cdp(
+        &mut ctx,
+        2,
+        "Runtime.evaluate",
+        json!({
+            "expression": "window.__codes = []; for (const type of ['keydown', 'keypress', 'keyup']) document.body.addEventListener(type, e => __codes.push([type, e.keyCode, e.which, e.charCode, e.shiftKey]))",
+            "returnByValue": true
+        }),
+        session_id,
+    ).await;
+    for (id, event_type) in [(3, "keyDown"), (4, "keyUp")] {
+        cdp(
+            &mut ctx,
+            id,
+            "Input.dispatchKeyEvent",
+            json!({"type": event_type, "key": "Enter", "code": "Enter", "text": "\r", "windowsVirtualKeyCode": 13, "modifiers": 8}),
+            session_id,
+        ).await;
+    }
+    let value = cdp(
+        &mut ctx,
+        5,
+        "Runtime.evaluate",
+        json!({"expression": "JSON.stringify(__codes)", "returnByValue": true}),
+        session_id,
+    ).await;
+    assert_eq!(
+        value["result"]["value"],
+        r#"[["keydown",13,13,0,true],["keypress",13,13,13,true],["keyup",13,13,0,true]]"#
+    );
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn dispatch_key_event_preserves_modifier_combinations() {
+    std::env::set_var("OBSCURA_ALLOW_PRIVATE_NETWORK", "1");
+    let url = serve_page().await;
+    let mut ctx = CdpContext::new();
+    let page_id = ctx.create_page();
+    let session_id = "session-1";
+    ctx.sessions.insert(session_id.to_string(), page_id);
+    cdp(&mut ctx, 1, "Page.navigate", json!({"url": url, "waitUntil": "load"}), session_id).await;
+    cdp(&mut ctx, 2, "Runtime.evaluate", json!({
+        "expression": "window.__modifiers = []; for (const type of ['keydown','keyup']) document.addEventListener(type, e => __modifiers.push([type, e.altKey, e.ctrlKey, e.metaKey, e.shiftKey, ...['Alt','Control','Meta','Shift'].map(k => e.getModifierState(k))]))"
+    }), session_id).await;
+    let mut expected = Vec::new();
+    let mut id = 3;
+    for modifiers in 0..16 {
+        for (event_type, dom_type) in [("rawKeyDown", "keydown"), ("keyUp", "keyup")] {
+            cdp(&mut ctx, id, "Input.dispatchKeyEvent", json!({
+                "type": event_type, "key": "o", "code": "KeyO",
+                "windowsVirtualKeyCode": 79, "modifiers": modifiers
+            }), session_id).await;
+            id += 1;
+            let flags = [1, 2, 4, 8].map(|mask| modifiers & mask != 0);
+            expected.push(json!([dom_type, flags[0], flags[1], flags[2], flags[3],
+                flags[0], flags[1], flags[2], flags[3]]));
+        }
+    }
+    let result = cdp(&mut ctx, id, "Runtime.evaluate", json!({
+        "expression": "JSON.stringify(__modifiers)", "returnByValue": true
+    }), session_id).await;
+    let actual: Value = serde_json::from_str(result["result"]["value"].as_str().unwrap()).unwrap();
+    assert_eq!(actual, json!(expected));
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn delete_key_removes_the_selected_range() {
+    std::env::set_var("OBSCURA_ALLOW_PRIVATE_NETWORK", "1");
+    let url = serve_page().await;
+    let mut ctx = CdpContext::new();
+    let page_id = ctx.create_page();
+    let session_id = "session-1";
+    ctx.sessions.insert(session_id.to_string(), page_id);
+    cdp(&mut ctx, 1, "Page.navigate", json!({"url": url, "waitUntil": "load"}), session_id).await;
+    cdp(
+        &mut ctx,
+        2,
+        "Runtime.evaluate",
+        json!({
+            "expression": "i.focus(); i.value = 'abcd'; i.setSelectionRange(1, 3); window.__inputs = 0; i.addEventListener('input', () => __inputs++)",
+            "returnByValue": true
+        }),
+        session_id,
+    ).await;
+    cdp(
+        &mut ctx,
+        3,
+        "Input.dispatchKeyEvent",
+        json!({"type": "keyDown", "key": "Delete", "code": "Delete", "windowsVirtualKeyCode": 46}),
+        session_id,
+    ).await;
+    let value = cdp(
+        &mut ctx,
+        4,
+        "Runtime.evaluate",
+        json!({"expression": "JSON.stringify({value: i.value, start: i.selectionStart, inputs: __inputs})", "returnByValue": true}),
+        session_id,
+    ).await;
+    assert_eq!(value["result"]["value"], r#"{"value":"ad","start":1,"inputs":1}"#);
+}
+
 // The same hazard one layer over: on the inserted *text* rather than on the key
 // name. `insert_text_js` interpolates the text into the same kind of
 // single-quoted literal. #433 escaped the backslash and the quote and stopped
@@ -162,5 +273,54 @@ async fn dispatch_key_event_char_carries_a_newline_into_a_textarea() {
         v["result"]["value"].as_str().unwrap_or_default(),
         r#""a\nb""#,
         "a newline sent as a char must reach the field, not be dropped by a malformed snippet"
+    );
+}
+
+// #577: Playwright's fill() focuses the field in page and then types the whole
+// value with one Input.insertText call. The method must exist and drive the
+// same snippet the key-event text path uses, so quotes, backslashes, and
+// newlines survive intact.
+#[tokio::test(flavor = "current_thread")]
+async fn insert_text_types_into_the_focused_field() {
+    std::env::set_var("OBSCURA_ALLOW_PRIVATE_NETWORK", "1");
+    let url = serve_page().await;
+    let mut ctx = CdpContext::new();
+    let page_id = ctx.create_page();
+    let session_id = "session-1";
+    ctx.sessions.insert(session_id.to_string(), page_id.clone());
+
+    cdp(&mut ctx, 1, "Page.navigate", json!({"url": url, "waitUntil": "load"}), session_id).await;
+    cdp(
+        &mut ctx,
+        2,
+        "Runtime.evaluate",
+        json!({"expression": "document.getElementById('i').focus()", "returnByValue": true}),
+        session_id,
+    )
+    .await;
+    cdp(
+        &mut ctx,
+        3,
+        "Input.insertText",
+        json!({"text": "he'll\\o\nbye"}),
+        session_id,
+    )
+    .await;
+
+    let v = cdp(
+        &mut ctx,
+        4,
+        "Runtime.evaluate",
+        json!({
+            "expression": "JSON.stringify(document.getElementById('i').value)",
+            "returnByValue": true,
+        }),
+        session_id,
+    )
+    .await;
+    assert_eq!(
+        v["result"]["value"].as_str().unwrap_or_default(),
+        r#""he'll\\o\nbye""#,
+        "insertText must type the full text with quotes, backslashes, and newlines intact"
     );
 }
