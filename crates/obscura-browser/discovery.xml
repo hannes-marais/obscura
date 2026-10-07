@@ -1,0 +1,12 @@
+<discovery>
+  <about>obscura-browser, the Page and BrowserContext layer: navigation, lifecycle, JavaScript evaluation, resource loading, screenshots, PDF export and browser identity profiles.</about>
+  <see href="src/page.rs">The Page type (over 10,000 lines): navigate_with_wait and navigation chains, redirects and status, subresource and stylesheet loading, network events and stored response bodies, evaluation and settling, cookies and storage, geolocation override, render resource preparation, viewport and full-page screenshots and screencast frames.</see>
+  <see href="src/pdf.rs">Bounded raster-backed PDF export over the retained document painter: print-media layout fitted to the printable area, page ranges, paper size, margins and scale options, explicit errors, and no claim of CSS paged-media support or selectable text.</see>
+  <see href="src/context.rs">BrowserContext: the per-context cookie jar and HTTP client, user agent and platform identity, proxy, robots cache and obey-robots flag, stealth flag, storage directory, and the allow_file_access and allow_private_network security switches enforced by page navigation.</see>
+  <see href="src/profiles.rs">Built-in pool of consistent browser identity profiles (platform, userAgentData, user agent and GPU renderer); a single stable profile by default, OBSCURA_PROFILE to pin one and OBSCURA_ROTATE_PROFILE to pick randomly per context.</see>
+  <see href="src/lifecycle.rs">Lifecycle state and the WaitUntil levels used by navigation and the CLI: init, commit, domcontentloaded, load, networkidle2 and networkidle0, emitted as Page.lifecycleEvent to CDP clients.</see>
+  <see href="src/idle_deadline.rs">Helper that keeps polling the runtime while waiting for page activity up to a deadline, avoiding a coalesced final idle-deadline wake that could miss late work.</see>
+  <see href="src/fork_virtual_url.rs">Fork-only patch that makes page.url() adopt a URL the page routed to itself with history.pushState, so single-page app clicks are visible to CDP clients; kept outside page.rs to ease upstream merges.</see>
+  <see href="tests/binary_fetch_body.rs">Tests that fetch() from page JavaScript preserves binary request bodies byte for byte against a local echo server, run with both the default reqwest transport and the stealth transport.</see>
+  <see href="tests/unhandled_rejection.rs">Tests that a rejected promise in background page code is reported without stopping the page event loop, so later timers and work still run on the same page.</see>
+</discovery>

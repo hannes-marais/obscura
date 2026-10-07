@@ -1,0 +1,8 @@
+<discovery>
+  <about>obscura-mcp, the Model Context Protocol server that gives AI agents stateful browser tools over stdio or HTTP.</about>
+  <see href="src/lib.rs">The MCP server core: BrowserState with tabs and the current page, about 37 browser_* tools (navigate, snapshot, markdown, links, extract, interactive elements, forms, click, fill, type, keys, scroll, waits, evaluate, network and console logs, screenshot, PDF, cookies, storage state, tabs) and output size caps for agent context.</see>
+  <see href="src/http.rs">HTTP transport for obscura mcp --http: request body and header caps against memory exhaustion, bearer token checks required for non-loopback binds, an Origin allowlist refusing browser callers by default, JSON-RPC and SSE handling and connection bounds.</see>
+  <see href="build.rs">Build script that appends the git commit to the version reported by the MCP server for local builds, keeping the bare version for tarball and minimal-image builds.</see>
+  <see href="tests/cors_preflight.rs">Tests that browser callers are denied unless their Origin is explicitly allowlisted, including CORS preflight, while native MCP clients without an Origin are unaffected.</see>
+  <see href="tests/sse_stream_does_not_wedge.rs">Regression test that an open SSE stream (GET /mcp with Accept text/event-stream) does not wedge the single-threaded MCP HTTP server: the keep-alive ping loop must be detached so later requests are still accepted.</see>
+</discovery>

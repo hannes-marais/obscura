@@ -1,0 +1,8 @@
+<discovery>
+  <about>obscura-dom, the DOM tree, HTML parser integration, CSS selector matching and serialization shared by the runtime and renderer.</about>
+  <see href="src/tree.rs">DomTree and Node data: node ids, elements, text and comments, attributes, shadow roots with modes, form control state, external stylesheets, and mutation methods whose reparenting guards reject cycles and cap descendant traversal to prevent engine hangs.</see>
+  <see href="src/tree_sink.rs">html5ever TreeSink building a DomTree from HTML: parse_html, fragment parsing with context, declarative shadow DOM templates with valid shadow host name checks, and parser-inserted node handling.</see>
+  <see href="src/selector.rs">CSS selector engine on the servo selectors crate: parsing, pseudo-classes and pseudo-elements, matching against DomTree elements with caches and an ancestor bloom filter, and a fast path for bare id selectors.</see>
+  <see href="src/serialize.rs">Serialization of DOM subtrees back to HTML for outerHTML, innerHTML and the html dump, escaping text content and attribute values and handling void elements and raw text elements.</see>
+  <see href="tests/slot_query_allocations.rs">Allocation regression test using the shared test-support counter: slot and query traversal may allocate small vectors, but must never copy an unrelated 64 KiB DOM node payload.</see>
+</discovery>

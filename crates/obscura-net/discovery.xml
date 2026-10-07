@@ -1,0 +1,11 @@
+<discovery>
+  <about>obscura-net, the networking layer: default and stealth HTTP clients, SSRF guarding, cookies, encodings, robots.txt and the tracker blocklist.</about>
+  <see href="src/client.rs">ObscuraHttpClient on reqwest: resource requests with type, mode and credentials, redirects, custom trust stores via SSL_CERT_FILE and SSL_CERT_DIR, proxies, the SsrfGuardResolver that checks addresses at DNS resolution, callback registry and error types.</see>
+  <see href="src/wreq_client.rs">StealthHttpClient on wreq and BoringSSL presenting a consistent Chrome TLS ClientHello, ALPN and header order, with its own SSRF-guarding DNS resolver so stealth mode cannot reach private addresses, and tracker blocking.</see>
+  <see href="src/cookies.rs">CookieJar implementing RFC 6265bis: domain canonicalization ignoring a leading dot, default cookie paths, SameSite normalization and same-site context checks, expiry, HttpOnly and Secure handling, and serialization for storage persistence.</see>
+  <see href="src/encoding.rs">Charset detection and decoding of response bodies (issue 113): labels from headers, BOMs and meta tags for GBK, Big5 and other encodings instead of lossy UTF-8, plus URL query encoding in the document charset.</see>
+  <see href="src/robots.rs">RobotsCache for --obey-robots: fetches and parses robots.txt per origin up to Google's documented size limit, evicting the oldest origins beyond a bound.</see>
+  <see href="src/blocklist.rs">Tracker blocklist lookup used by the stealth transport: checks a host and its parent domains against the bundled pgl_domains.txt list of analytics, ad and fingerprinting domains.</see>
+  <see href="src/operator_hint.rs">Operator-facing hints for private-network denials: explains the --allow-private-network opt-in for ordinary local addresses but never suggests relaxing the guard for cloud metadata or special-purpose ranges.</see>
+  <see href="src/pgl_domains.txt">The bundled tracker and ad domain list (3,520 hostnames, starting with entries such as 101com.com) compiled into the binary and checked by blocklist.rs when stealth tracker blocking is enabled.</see>
+</discovery>
