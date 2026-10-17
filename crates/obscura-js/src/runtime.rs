@@ -4938,6 +4938,64 @@ mod tests {
         );
     }
 
+    #[tokio::test(flavor = "current_thread")]
+    async fn fetch_object_url_preserves_binary_bytes_and_response_contract() {
+        let mut rt = setup_runtime("<html><body></body></html>");
+        let result = rt.call_function_on_for_cdp(
+            r#"async () => {
+                const input = new Uint8Array([0, 255, 128, 65]);
+                const blob = new Blob([input], {type: 'application/octet-stream'});
+                const url = URL.createObjectURL(blob);
+                input.fill(7);
+                blob._bytes.fill(9);
+                const response = await fetch(url + '#fragment');
+                const copy = response.clone();
+                const first = Array.from(new Uint8Array(await response.arrayBuffer()));
+                const second = Array.from(new Uint8Array(await copy.arrayBuffer()));
+                const repeated = Array.from(new Uint8Array(await (await fetch(url)).arrayBuffer()));
+                const result = {first, second, repeated, status: response.status,
+                    type: response.headers.get('content-type'),
+                    length: response.headers.get('content-length'), used: response.bodyUsed,
+                    url: response.url === url};
+                URL.revokeObjectURL(url);
+                return result;
+            }"#, None, &[], true, true,
+        ).await.unwrap();
+        assert_eq!(result.value, Some(serde_json::json!({
+            "first": [0, 255, 128, 65], "second": [0, 255, 128, 65],
+            "repeated": [0, 255, 128, 65], "status": 200,
+            "type": "application/octet-stream", "length": "4", "used": true, "url": true,
+        })));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn fetch_object_url_rejects_revoked_unknown_methods_and_aborted_reads() {
+        let mut rt = setup_runtime("<html><body></body></html>");
+        let result = rt.call_function_on_for_cdp(
+            r#"async () => {
+                const url = URL.createObjectURL(new File(['text'], 'source.txt', {type:'text/plain'}));
+                const rejects = async (value, init) => {
+                    try { await fetch(value, init); return false; }
+                    catch (error) { return error instanceof TypeError; }
+                };
+                const post = await rejects(url, {method:'POST'});
+                const controller = new AbortController();
+                controller.abort('stopped');
+                let abortReason;
+                try { await fetch(url, {signal:controller.signal}); }
+                catch (error) { abortReason = error; }
+                const admitted = await fetch(url);
+                URL.revokeObjectURL(url);
+                return {post, abortReason, admittedText:await admitted.text(),
+                    revoked:await rejects(url), unknown:await rejects(url + '-unknown')};
+            }"#, None, &[], true, true,
+        ).await.unwrap();
+        assert_eq!(result.value, Some(serde_json::json!({
+            "post": true, "abortReason": "stopped", "admittedText": "text",
+            "revoked": true, "unknown": true,
+        })));
+    }
+
     // SEC-301 / SEC-302 / #792 — the profile setters must embed values safely.
     // set_platform must not allow a backslash-before-quote to break out of the
     // JS string literal (injection), and set_user_agent must not silently fail

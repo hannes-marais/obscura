@@ -7838,6 +7838,9 @@ function _serializeBody(initBody, headers, synthesizeContentType = true) {
   return new TextEncoder().encode(typeof initBody === 'string' ? initBody : String(initBody));
 }
 
+// Object URLs are runtime-local byte references, not HTTP requests. Keep the
+// snapshots private; the separate Worker registry retains decoded script text.
+const _objectURLBlobs = new Map();
 async function _fetch(input, init = {}, resourceType = "Fetch") {
   init = init || {};
   const request = input instanceof Request ? input : null;
@@ -7880,6 +7883,19 @@ async function _fetch(input, init = {}, resourceType = "Fetch") {
   const signal = inputSignal == null ? null : _createDependentAbortSignal([inputSignal]);
   const signalState = signal && _abortSignalState(signal);
   if (signalState && signalState.aborted) throw signalState.reason;
+  if (url.startsWith('blob:')) {
+    const address = url.split('#')[0];
+    const blob = _objectURLBlobs.get(address);
+    if (!blob || method !== 'GET') throw new TypeError('Failed to fetch object URL');
+    const bytes = await blob.arrayBuffer();
+    if (signalState && signalState.aborted) throw signalState.reason;
+    const response = _createInternalResponse(bytes, {
+      status: 200, statusText: 'OK', type: 'basic', url: address,
+      headers: { 'content-type': blob.type, 'content-length': String(blob.size) },
+    });
+    _attachResponseAbort(response, signal);
+    return response;
+  }
   const cancelRid = signal ? __obscuraCore.ops.op_fetch_cancel_handle() : undefined;
   const cancellation = { rid: cancelRid };
   const removeAbort = signal ? _addAbortAlgorithm(signal, cancellation, _cancelFetchHandle) : null;
@@ -15555,6 +15571,9 @@ URL.createObjectURL = function(blob) {
           return (c === 'x' ? r : (r & 0x3) | 0x8).toString(16);
         });
     const id = 'blob:' + origin + '/' + uuid;
+    _objectURLBlobs.set(id, typeof blob.slice === 'function'
+      ? blob.slice(0, blob.size, blob.type)
+      : new Blob([blob._bytes], { type: blob.type }));
     // Store synchronously so a Worker built from the blob URL in the same
     // tick sees its source. Blob-URL Worker construction is synchronous in
     // real browsers; the previous async blob.text().then() store raced the
@@ -15575,6 +15594,7 @@ URL.createObjectURL = function(blob) {
   }
 };
 URL.revokeObjectURL = function(url) {
+  _objectURLBlobs.delete(String(url));
   delete globalThis.__blobStore[url];
 };
 
