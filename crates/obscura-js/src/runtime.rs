@@ -4870,6 +4870,44 @@ mod tests {
         );
     }
 
+    #[cfg(feature = "render")]
+    #[test]
+    fn select_value_changes_live_choice_without_mutating_default_selected() {
+        let mut rt = setup_runtime(
+            "<!doctype html><html><body><select id=page><option value=25 selected>25 decks</option><option value=50>50 decks</option></select></body></html>",
+        );
+        rt.set_viewport(240.0, 80.0);
+        let before = rt
+            .screenshot_prepared((240.0, 80.0), Some("http://example.com/test"))
+            .unwrap();
+        let result = rt
+            .evaluate(
+                r#"(() => {
+                    const select = document.getElementById('page');
+                    const events = [];
+                    select.addEventListener('change', event => events.push(event.target.value));
+                    select.value = '50';
+                    select.dispatchEvent(new Event('change', { bubbles: true }));
+                    return JSON.stringify({
+                        value: select.value,
+                        index: select.selectedIndex,
+                        defaults: [...select.options].map(option => option.hasAttribute('selected')),
+                        events,
+                    });
+                })()"#,
+            )
+            .unwrap();
+        let value: serde_json::Value = serde_json::from_str(result.as_str().unwrap()).unwrap();
+        assert_eq!(value["value"], "50");
+        assert_eq!(value["index"], 1);
+        assert_eq!(value["defaults"], serde_json::json!([true, false]));
+        assert_eq!(value["events"], serde_json::json!(["50"]));
+        let after = rt
+            .screenshot_prepared((240.0, 80.0), Some("http://example.com/test"))
+            .unwrap();
+        assert_ne!(before, after, "the new live choice must repaint");
+    }
+
     #[test]
     fn cloned_controls_keep_current_value_and_checked_state() {
         let mut rt = setup_runtime(

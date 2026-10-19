@@ -4405,19 +4405,19 @@ class Element extends Node {
       return;
     }
     if (tag === 'select') {
-      // Set selected on matching option, clear on others. Puppeteer's
-      // page.select(selector, value) round-trips through this setter and
-      // dispatches its own input/change events in-page afterwards, like a
-      // real browser: a programmatic value assignment never fires change
-      // itself. Dispatching here fed pages that assign inside a change
-      // handler back into that handler in an infinite loop.
+      // A select's current selectedness is separate from each option's
+      // `selected` content attribute (its defaultSelected state). Changing
+      // those attributes here notifies MutationObservers and can make a
+      // document-driven app re-render the old choice before its change
+      // handler receives the new value.
       const wanted = String(v);
       const opts = this.querySelectorAll('option');
       for (let i = 0; i < opts.length; i++) {
         const attrV = opts[i].getAttribute('value');
         const optVal = attrV !== null ? attrV : opts[i].textContent;
-        opts[i].selected = optVal === wanted;
+        opts[i]._selected = optVal === wanted;
       }
+      _dom("set_form_value", this._nid, wanted);
       return;
     }
     const value = String(v);
@@ -4848,7 +4848,7 @@ class Element extends Node {
   get selectedIndex() {
     const opts = this.options;
     for (let i = 0; i < opts.length; i++) {
-      if (opts[i].selected || opts[i].hasAttribute('selected')) return i;
+      if (opts[i].selected) return i;
     }
     // Only a single select implicitly selects its first option; a multiple
     // select with nothing chosen idles at -1 like a real browser.
