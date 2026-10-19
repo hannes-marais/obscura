@@ -6281,10 +6281,12 @@ class Document extends Node {
       // have a separate XML stack, so return a minimal detached document
       // with an element of the requested local name as documentElement.
       createDocument(_ns, qualifiedName, _doctype) {
-        const name = (qualifiedName && String(qualifiedName)) || "root";
+        const name = qualifiedName ? String(qualifiedName) : "root";
         const safe = name.replace(/[^a-zA-Z0-9-]/g, "");
-        const html = qualifiedName ? `<${safe}></${safe}>` : "";
-        const doc = new DOMParser().parseFromString(html, "application/xml");
+        const doc = new DOMParser().parseFromString(`<${safe}></${safe}>`, "application/xml");
+        // A blank qualifiedName requests an empty XML Document, into which
+        // callers such as AppGen's encodeBlock insert their own root element.
+        if (!qualifiedName) doc.removeChild(doc.documentElement);
         if (_doctype) doc._docType = _doctype;
         return doc;
       },
@@ -11649,7 +11651,7 @@ globalThis.DOMParser = class DOMParser {
     const findByTagName = (name) => walk(root, n => n.tagName === name);
 
     const docNode = {
-      _root: root,
+      get _root() { return root; },
       nodeName: "#document",
       nodeType: 9,
       queryCommandSupported: Document.prototype.queryCommandSupported,
@@ -11678,8 +11680,8 @@ globalThis.DOMParser = class DOMParser {
       },
       get firstChild() { return root; },
       get lastChild() { return root; },
-      get children() { return [root]; },
-      get childNodes() { return [root]; },
+      get children() { return root ? [root] : []; },
+      get childNodes() { return root ? [root] : []; },
       // Document metadata the WHATWG interface exposes; DOMParser documents have
       // URL about:blank, are already fully parsed, and carry no stylesheets.
       get URL() { return "about:blank"; },
@@ -11699,23 +11701,18 @@ globalThis.DOMParser = class DOMParser {
       createTreeWalker(r, ws, f) { return document.createTreeWalker(r || root, ws, f); },
       createNodeIterator(r, ws, f) { return document.createNodeIterator(r || root, ws, f); },
       querySelector(s) {
+        if (!root) return null;
         // For XML parsererror docs, check the root element as well —
         // the <parsererror> is the documentElement, not a descendant.
         return root.querySelector(s) || (isXml && root.matches(s) ? root : null);
       },
-      querySelectorAll(s) { return root.querySelectorAll(s); },
+      querySelectorAll(s) { return root ? root.querySelectorAll(s) : []; },
       getElementById(id) {
         return walk(root, n => n.getAttribute && n.getAttribute("id") === id);
       },
-      getElementsByTagName(t) {
-        return root.querySelectorAll(t);
-      },
-      getElementsByClassName(c) {
-        return _getElementsByClassName(root, c);
-      },
-      getElementsByName(n) {
-        return root.querySelectorAll(`[name="${n}"]`);
-      },
+      getElementsByTagName(t) { return root ? root.querySelectorAll(t) : []; },
+      getElementsByClassName(c) { return root ? _getElementsByClassName(root, c) : []; },
+      getElementsByName(n) { return root ? root.querySelectorAll(`[name="${n}"]`) : []; },
       createElement: (t) => document.createElement(t),
       createElementNS: (ns, t) => document.createElementNS(ns, t),
       createTextNode: (t) => document.createTextNode(t),
@@ -11737,18 +11734,34 @@ globalThis.DOMParser = class DOMParser {
       },
       adoptNode: (n) => n,
       importNode: (n) => n,
-      // Document-level node insertion. Detached docs from createHTMLDocument /
-      // createDocument back onto the same tree, so appending lands under the
-      // documentElement; enough for dom/common.js to build its Range fixtures.
-      appendChild: function (n) { try { root.appendChild(n); } catch (e) {} return n; },
-      removeChild: function (n) { try { root.removeChild(n); } catch (e) {} return n; },
-      insertBefore: function (n, ref) { try { root.insertBefore(n, ref); } catch (e) {} return n; },
+      // An XML Document owns one top-level element. In particular,
+      // createDocument('', '', null) begins empty and accepts its first root.
+      appendChild: function (n) {
+        if (isXml) {
+          if (root) throw new DOMException('Document already has a root element', 'HierarchyRequestError');
+          root = n;
+        } else if (root) root.appendChild(n);
+        return n;
+      },
+      removeChild: function (n) {
+        if (n === root) root = null;
+        else if (root) root.removeChild(n);
+        return n;
+      },
+      insertBefore: function (n, ref) {
+        if (isXml && (!root || ref === root)) {
+          if (root) throw new DOMException('Document already has a root element', 'HierarchyRequestError');
+          root = n;
+        } else if (root) root.insertBefore(n, ref);
+        return n;
+      },
       _docType: null,
       get doctype() { return this._docType; },
       cloneNode: function (deep) {
-        return new DOMParser().parseFromString(root.outerHTML, mimeType);
+        return root ? new DOMParser().parseFromString(root.outerHTML, mimeType)
+          : document.implementation.createDocument('', '', null);
       },
-      contains(n) { return root.contains ? root.contains(n) : false; },
+      contains(n) { return root && root.contains ? root.contains(n) : false; },
       addEventListener() {}, removeEventListener() {}, dispatchEvent() { return true; },
     };
     _documentInstances.add(docNode);

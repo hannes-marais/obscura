@@ -7192,6 +7192,15 @@ mod tests {
     }
 
     #[test]
+    fn empty_xml_document_encodes_a_single_block_root() {
+        let mut rt = setup_runtime("<html><body></body></html>");
+        let value = rt
+            .evaluate("(function(){var d=document.implementation.createDocument('', '', null);var empty=d.documentElement===null;var wrapper=d.createElementNS(null,'blocks');d.appendChild(wrapper);var footer=d.createElementNS(null,'cps-footer');wrapper.appendChild(footer);var welcome=d.createElementNS(null,'isWelcome');welcome.textContent='true';footer.appendChild(welcome);var canNew=d.createElementNS(null,'canNew');canNew.textContent='true';footer.appendChild(canNew);var xml=new XMLSerializer().serializeToString(d);var parsed=new DOMParser().parseFromString(xml,'application/xml');return [empty,xml,parsed.documentElement.tagName,parsed.querySelector('parsererror')===null].join('|');})()")
+            .unwrap();
+        assert_eq!(value, serde_json::json!("true|<blocks><cps-footer><isWelcome>true</isWelcome><canNew>true</canNew></cps-footer></blocks>|blocks|true"));
+    }
+
+    #[test]
     fn a_parsererror_says_what_was_wrong() {
         // The <div> is where Chrome puts the reason, and callers show it. A
         // parsererror that only says "error while parsing XML" tells a user
