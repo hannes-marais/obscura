@@ -4909,6 +4909,44 @@ mod tests {
     }
 
     #[test]
+    fn select_and_details_have_distinct_dom_interface_types() {
+        let mut rt = setup_runtime(
+            "<html><body><select id=page><option value=25>25</option><option value=50>50</option></select><details id=help></details></body></html>",
+        );
+        let result = rt.evaluate(r#"(() => {
+            const select = document.getElementById('page');
+            const details = document.getElementById('help');
+            const createdSelect = document.createElement('select');
+            const createdDetails = document.createElement('details');
+            select.value = '50';
+            // This is the AppUI value-routing guard used by generated Web apps.
+            const routedValue = select instanceof HTMLDetailsElement
+                ? String(select.open) : ('value' in select ? String(select.value) : undefined);
+            return JSON.stringify({
+                selectIsSelect: select instanceof HTMLSelectElement,
+                selectIsDetails: select instanceof HTMLDetailsElement,
+                detailsIsDetails: details instanceof HTMLDetailsElement,
+                detailsIsSelect: details instanceof HTMLSelectElement,
+                createdSelectIsSelect: createdSelect instanceof HTMLSelectElement,
+                createdSelectIsDetails: createdSelect instanceof HTMLDetailsElement,
+                createdDetailsIsDetails: createdDetails instanceof HTMLDetailsElement,
+                createdDetailsIsSelect: createdDetails instanceof HTMLSelectElement,
+                routedValue,
+            });
+        })()"#).unwrap();
+        let value: serde_json::Value = serde_json::from_str(result.as_str().unwrap()).unwrap();
+        assert_eq!(value["selectIsSelect"], true);
+        assert_eq!(value["selectIsDetails"], false);
+        assert_eq!(value["detailsIsDetails"], true);
+        assert_eq!(value["detailsIsSelect"], false);
+        assert_eq!(value["createdSelectIsSelect"], true);
+        assert_eq!(value["createdSelectIsDetails"], false);
+        assert_eq!(value["createdDetailsIsDetails"], true);
+        assert_eq!(value["createdDetailsIsSelect"], false);
+        assert_eq!(value["routedValue"], "50");
+    }
+
+    #[test]
     fn cloned_controls_keep_current_value_and_checked_state() {
         let mut rt = setup_runtime(
             "<html><body><div id=group><input id=field value=default><input id=box type=checkbox></div></body></html>",

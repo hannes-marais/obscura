@@ -7074,6 +7074,8 @@ function _elementClassFor(nid) {
       && _domParse("namespace_uri", nid) === "http://www.w3.org/1999/xhtml"
       && _domParse("local_name", nid) === "input") return globalThis.HTMLInputElement;
   if (tag === "TEXTAREA" && globalThis.HTMLTextAreaElement) return globalThis.HTMLTextAreaElement;
+  if (tag === "SELECT" && globalThis.HTMLSelectElement) return globalThis.HTMLSelectElement;
+  if (tag === "DETAILS" && globalThis.HTMLDetailsElement) return globalThis.HTMLDetailsElement;
   if (tag === "META" && globalThis.HTMLMetaElement
       && _domParse("namespace_uri", nid) === "http://www.w3.org/1999/xhtml"
       && _domParse("local_name", nid) === "meta") return globalThis.HTMLMetaElement;
@@ -7104,6 +7106,8 @@ function _elementClassForKnownName(namespace, qualifiedName) {
     if (tag === "FORM" && globalThis.HTMLFormElement) return globalThis.HTMLFormElement;
     if (localName === "input" && globalThis.HTMLInputElement) return globalThis.HTMLInputElement;
     if (tag === "TEXTAREA" && globalThis.HTMLTextAreaElement) return globalThis.HTMLTextAreaElement;
+    if (tag === "SELECT" && globalThis.HTMLSelectElement) return globalThis.HTMLSelectElement;
+    if (tag === "DETAILS" && globalThis.HTMLDetailsElement) return globalThis.HTMLDetailsElement;
     if (localName === "meta" && globalThis.HTMLMetaElement) return globalThis.HTMLMetaElement;
     if (tag === "SLOT" && globalThis.HTMLSlotElement) return globalThis.HTMLSlotElement;
     if (tag === "IMG") return HTMLImageElement;
@@ -13191,7 +13195,10 @@ globalThis.HTMLFormElement = class HTMLFormElement extends Element {
     }
   }
 };
-globalThis.HTMLSelectElement = Element;
+// Native element interfaces must remain distinct: clients often test details
+// before reading a select's value. An Element alias makes every select look
+// like a details element and submits its `open` state instead of its choice.
+globalThis.HTMLSelectElement = class HTMLSelectElement extends Element {};
 globalThis.HTMLTextAreaElement = class HTMLTextAreaElement extends Element {
   get readOnly() { return this.hasAttribute('readonly'); }
   set readOnly(v) { if (v) this.setAttribute('readonly', ''); else this.removeAttribute('readonly'); }
@@ -13290,7 +13297,7 @@ globalThis.HTMLDataListElement = Element;
 globalThis.HTMLFieldSetElement = Element;
 globalThis.HTMLLegendElement = Element;
 globalThis.HTMLProgressElement = Element;
-globalThis.HTMLDetailsElement = Element;
+globalThis.HTMLDetailsElement = class HTMLDetailsElement extends Element {};
 globalThis.HTMLDialogElement = Element;
 // SVGAnimatedString backs the className and href reflections on SVG elements.
 // baseVal and animVal both read the live attribute (no SMIL animation), and
