@@ -7174,6 +7174,24 @@ mod tests {
     }
 
     #[test]
+    fn dom_parser_preserves_xml_root_case_and_children() {
+        let mut rt = setup_runtime("<html><body></body></html>");
+        let value = rt
+            .evaluate("(function(){var xml='<blocks><decker-editor-fields><template name=\"Sample\"><pageSizeOptions>25</pageSizeOptions></template></decker-editor-fields></blocks>';var d=new DOMParser().parseFromString(xml,'application/xml');var r=d.documentElement;return [r.tagName,r.children[0].tagName,r.children[0].children[0].getAttribute('name'),r.children[0].children[0].children[0].tagName,r.children[0].children[0].children[0].textContent,d.querySelector('parsererror')===null].join('|');})()")
+            .unwrap();
+        assert_eq!(value, serde_json::json!("blocks|decker-editor-fields|Sample|pageSizeOptions|25|true"));
+    }
+
+    #[test]
+    fn dom_parser_handles_large_xml_catalog_and_empty_bindings() {
+        let mut rt = setup_runtime("<html><body></body></html>");
+        let value = rt
+            .evaluate("(function(){var rows=Array.from({length:114},(_,i)=>'<template name=\"t'+i+'\"><label>A &amp; B'+ 'x'.repeat(450) +'</label></template>').join('');var d=new DOMParser().parseFromString('<blocks><decker-editor-fields>'+rows+'</decker-editor-fields></blocks>','application/xml');var empty=new DOMParser().parseFromString('<blocks><dossier-files></dossier-files></blocks>','application/xml');return [d.documentElement.tagName,d.documentElement.children[0].children.length,d.documentElement.children[0].children[0].children[0].textContent.slice(0,5),empty.documentElement.tagName,empty.documentElement.children[0].tagName].join('|');})()")
+            .unwrap();
+        assert_eq!(value, serde_json::json!("blocks|114|A & B|blocks|dossier-files"));
+    }
+
+    #[test]
     fn a_parsererror_says_what_was_wrong() {
         // The <div> is where Chrome puts the reason, and callers show it. A
         // parsererror that only says "error while parsing XML" tells a user

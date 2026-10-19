@@ -11446,20 +11446,9 @@ const _checkXmlWellFormed = (html) => {
   return { wellFormed: true };
 };
 
-// Real-enough DOMParser. The previous one-liner returned `globalThis.document`,
-// so anything that did `new DOMParser().parseFromString(s, 'text/html')` and
-// then read `.body.innerHTML` mutated the LIVE page (jQuery 3.x's selector
-// feature-detect writes `<form></form>` and wiped real bodies). We parse the
-// input into a detached `<html>` element and wrap it so the common Document
-// API surface (body / head / documentElement / querySelector* / getElementById /
-// getElementsByTagName / getElementsByClassName / title / cloneNode) works.
-// Conservative XML well-formedness check. obscura has no XML parser, so this
-// only decides whether to surface a <parsererror> (it does not build an XML
-// tree). It flags clear structural errors — mismatched or unclosed tags,
-// multiple/no root elements, unterminated comment/CDATA/PI — and defaults to
-// "well-formed" whenever the scan is ambiguous, so valid XML is never falsely
-// flagged. Quoted attribute regions, comments, CDATA, PIs and the doctype are
-// skipped; a literal '<' in text (invalid in XML) reads as a bad tag.
+// DOMParser uses a detached HTML fragment for text/html and a case-preserving
+// XML tree for XML MIME types. The XML scanner rejects malformed structure;
+// the separate descriptive check supplies parsererror detail.
 function _xmlWellFormed(src) {
   const s = String(src);
   const stack = [];
@@ -11503,20 +11492,118 @@ function _xmlWellFormed(src) {
   return stack.length === 0 && rootsClosed === 1;
 }
 
-// The parsererror detail quotes tag names taken from the input, and it is
-// written through innerHTML, so `<` and `&` have to stop being markup.
-const _escapeXmlErrorText = (text) =>
-  String(text).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+// Build XML nodes without the HTML fragment parser. HTML parsing inserts an
+// <html> wrapper and folds names, which makes valid application/xml unusable
+// to callers that inspect documentElement or case-sensitive child names.
+function _parseXmlTree(source) {
+  const stack = [];
+  const namespaces = [{ xml: "http://www.w3.org/XML/1998/namespace" }];
+  let root = null;
+  let i = 0;
+  const decode = value => {
+    if (/&(?!(?:#(?:x[0-9a-fA-F]+|[0-9]+)|amp|lt|gt|quot|apos);)/.test(value)) {
+      throw new Error('Invalid XML entity');
+    }
+    return value.replace(/&(#(?:x[0-9a-fA-F]+|[0-9]+)|amp|lt|gt|quot|apos);/g, (_, entity) => {
+      if (entity[0] === '#') {
+        const cp = entity[1] === 'x'
+          ? parseInt(entity.slice(2), 16) : parseInt(entity.slice(1), 10);
+        return String.fromCodePoint(cp);
+      }
+      return { amp: '&', lt: '<', gt: '>', quot: '"', apos: "'" }[entity];
+    });
+  };
+  while (i < source.length) {
+    const lt = source.indexOf('<', i);
+    const endText = lt < 0 ? source.length : lt;
+    if (endText > i) {
+      const raw = source.slice(i, endText);
+      if (stack.length) stack[stack.length - 1].appendChild(document.createTextNode(decode(raw)));
+      else if (raw.trim()) return null;
+    }
+    if (lt < 0) break;
+    if (source.startsWith('<!--', lt)) {
+      const end = source.indexOf('-->', lt + 4);
+      if (end < 0) return null;
+      if (stack.length) stack[stack.length - 1].appendChild(document.createComment(source.slice(lt + 4, end)));
+      i = end + 3;
+      continue;
+    }
+    if (source.startsWith('<![CDATA[', lt)) {
+      const end = source.indexOf(']]>', lt + 9);
+      if (end < 0 || !stack.length) return null;
+      stack[stack.length - 1].appendChild(document.createTextNode(source.slice(lt + 9, end)));
+      i = end + 3;
+      continue;
+    }
+    if (source.startsWith('<?', lt)) {
+      const end = source.indexOf('?>', lt + 2);
+      if (end < 0) return null;
+      i = end + 2;
+      continue;
+    }
+    if (source.startsWith('<!', lt)) {
+      const end = source.indexOf('>', lt + 2);
+      if (end < 0) return null;
+      i = end + 1;
+      continue;
+    }
+    let end = lt + 1, quote = null;
+    while (end < source.length) {
+      const c = source[end];
+      if (quote) { if (c === quote) quote = null; }
+      else if (c === '"' || c === "'") quote = c;
+      else if (c === '>') break;
+      end++;
+    }
+    if (end >= source.length) return null;
+    const token = source.slice(lt + 1, end).trim();
+    i = end + 1;
+    if (token[0] === '/') {
+      if (!stack.length || stack[stack.length - 1].tagName !== token.slice(1).trim()) return null;
+      stack.pop();
+      namespaces.pop();
+      continue;
+    }
+    const selfClosing = token.endsWith('/');
+    const start = selfClosing ? token.slice(0, -1).trimEnd() : token;
+    const name = /^[^\s=/>]+/.exec(start)?.[0];
+    if (!name || (root && !stack.length)) return null;
+    const attrs = [];
+    let rest = start.slice(name.length);
+    while (rest.trim()) {
+      const match = /^\s+([^\s=/>]+)\s*=\s*(["'])([\s\S]*?)\2/.exec(rest);
+      if (!match) return null;
+      attrs.push([match[1], decode(match[3])]);
+      rest = rest.slice(match[0].length);
+    }
+    const ns = { ...namespaces[namespaces.length - 1] };
+    for (const [key, value] of attrs) {
+      if (key === 'xmlns') ns[''] = value;
+      else if (key.startsWith('xmlns:')) ns[key.slice(6)] = value;
+    }
+    const prefix = name.includes(':') ? name.slice(0, name.indexOf(':')) : '';
+    if (prefix && !ns[prefix]) return null;
+    const el = document.createElementNS(ns[prefix] || null, name);
+    for (const [key, value] of attrs) el.setAttribute(key, value);
+    if (stack.length) stack[stack.length - 1].appendChild(el);
+    else root = el;
+    if (!selfClosing) {
+      stack.push(el);
+      namespaces.push(ns);
+    }
+  }
+  return stack.length ? null : root;
+}
 
 globalThis.DOMParser = class DOMParser {
   parseFromString(source, mimeType) {
     const html = String(source ?? "");
     const isXml = typeof mimeType === "string" && /xml/i.test(mimeType);
-    const root = document.createElement("html");
+    let root = isXml ? null : document.createElement("html");
 
-    // For XML mime types, surface a <parsererror> on clearly-malformed input so
-    // error-detection code (doc.querySelector('parsererror')) works, matching
-    // Chrome. obscura has no XML parser, so the tree stays HTML-parsed.
+    // For XML MIME types, surface a <parsererror> on malformed input and
+    // otherwise expose a case-preserving XML documentElement.
     //
     // Two checks, one decision. `_xmlWellFormed` is the stricter of the pair --
     // it also rejects input with no root element at all, and an unterminated
@@ -11528,16 +11615,18 @@ globalThis.DOMParser = class DOMParser {
     // first. Since the stricter check flags everything the descriptive one
     // flags, the description never reached a caller.
     const xmlError = isXml ? _checkXmlWellFormed(html) : null;
-    const isParserError = isXml && (!_xmlWellFormed(html) || !xmlError.wellFormed);
+    if (isXml && _xmlWellFormed(html) && xmlError.wellFormed) {
+      try { root = _parseXmlTree(html); } catch (e) { root = null; }
+    }
+    const isParserError = isXml && !root;
     if (isParserError) {
       const detail = (xmlError && xmlError.error) || 'error while parsing XML';
-      try {
-        root.innerHTML =
-          '<parsererror xmlns="http://www.w3.org/1999/xhtml">This page contains the following errors:<div>' +
-          _escapeXmlErrorText(detail) +
-          '</div></parsererror>';
-      } catch (e) { /* ignore */ }
-    } else {
+      root = document.createElementNS("http://www.w3.org/1999/xhtml", "parsererror");
+      root.appendChild(document.createTextNode('This page contains the following errors:'));
+      const div = document.createElementNS("http://www.w3.org/1999/xhtml", "div");
+      div.appendChild(document.createTextNode(detail));
+      root.appendChild(div);
+    } else if (!isXml) {
       // innerHTML parses children via html5ever fragment-parsing rules. Most
       // HTML inputs start with `<!DOCTYPE>` / `<html>` / `<head>` etc.; the
       // fragment parser strips the outer `<html>` and emits its head+body
@@ -11566,9 +11655,6 @@ globalThis.DOMParser = class DOMParser {
       queryCommandSupported: Document.prototype.queryCommandSupported,
       contentType: isXml ? (mimeType || "application/xml") : "text/html",
       get documentElement() {
-        // For XML parsererror docs, return the <parsererror> child, not the
-        // <html> wrapper — matches Chrome's behavior.
-        if (isParserError) return root.firstElementChild;
         return root;
       },
       get body() { return findByTagName("BODY"); },
@@ -11615,7 +11701,7 @@ globalThis.DOMParser = class DOMParser {
       querySelector(s) {
         // For XML parsererror docs, check the root element as well —
         // the <parsererror> is the documentElement, not a descendant.
-        return root.querySelector(s) || (isParserError && root.matches(s) ? root : null);
+        return root.querySelector(s) || (isXml && root.matches(s) ? root : null);
       },
       querySelectorAll(s) { return root.querySelectorAll(s); },
       getElementById(id) {
@@ -11631,7 +11717,7 @@ globalThis.DOMParser = class DOMParser {
         return root.querySelectorAll(`[name="${n}"]`);
       },
       createElement: (t) => document.createElement(t),
-      createElementNS: (ns, t) => document.createElement(t),
+      createElementNS: (ns, t) => document.createElementNS(ns, t),
       createTextNode: (t) => document.createTextNode(t),
       createComment: (t) => document.createComment(t),
       createDocumentFragment: () => document.createDocumentFragment(),
