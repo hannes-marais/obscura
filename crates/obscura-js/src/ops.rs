@@ -712,30 +712,16 @@ fn fetch_max_body_bytes() -> usize {
 /// streamed chunks exceed the cap (a lying or chunked server). Streaming keeps
 /// a multi-GB response from ever being fully allocated.
 async fn read_body_capped(
-    mut response: reqwest::Response,
+    response: reqwest::Response,
     max: usize,
 ) -> Result<Vec<u8>, deno_error::JsErrorBox> {
-    if let Some(len) = response.content_length() {
-        if len > max as u64 {
-            return Err(deno_error::JsErrorBox::generic(format!(
-                "response body of {len} bytes exceeds the maximum of {max}"
-            )));
-        }
-    }
-    let mut buf: Vec<u8> = Vec::new();
-    while let Some(chunk) = response
-        .chunk()
-        .await
-        .map_err(|e| deno_error::JsErrorBox::generic(e.to_string()))?
-    {
-        if buf.len() + chunk.len() > max {
-            return Err(deno_error::JsErrorBox::generic(format!(
-                "response body exceeds the maximum of {max} bytes"
-            )));
-        }
-        buf.extend_from_slice(&chunk);
-    }
-    Ok(buf)
+    let url = response.url().clone();
+    obscura_net::client::read_reqwest_body_limited(response, &url, max).await
+        .map_err(|error| deno_error::JsErrorBox::generic(match error {
+            obscura_net::ObscuraNetError::ResponseTooLarge { .. } =>
+                format!("response body exceeds the maximum of {max} bytes"),
+            other => other.to_string(),
+        }))
 }
 
 struct PageInFlightGuard(Arc<std::sync::atomic::AtomicU32>);
@@ -3123,6 +3109,7 @@ fn build_request_client(proxy_url: Option<&str>) -> Result<reqwest::Client, Stri
     // workspace; OBSCURA_FETCH_TIMEOUT_MS overrides it for tighter cloud limits.
     let mut builder = reqwest::Client::builder()
         .redirect(reqwest::redirect::Policy::none())
+        .no_gzip().no_brotli().no_deflate()
         .timeout(fetch_timeout())
         // SSRF guard: also reject hostnames that resolve to a private/loopback IP.
         .dns_resolver(std::sync::Arc::new(obscura_net::SsrfGuardResolver::new(
@@ -4017,6 +4004,11 @@ async fn fetch_url_inner(
         for (k, v) in &current_headers {
             req = req.header(k.as_str(), v.as_str());
         }
+        if !current_headers.keys().any(|k| k.eq_ignore_ascii_case("accept-encoding")
+            || k.eq_ignore_ascii_case("range")) {
+            req = req.header("Accept-Encoding", "gzip, deflate, br");
+        }
+
 
         if !current_body.is_empty() {
             req = req.body(current_body.clone());

@@ -811,25 +811,60 @@ fn reject_oversized_content_length(
     Ok(())
 }
 
-async fn read_reqwest_body_limited(
-    mut response: reqwest::Response,
+// Keep representation headers intact while bounding the decoded body, as Fetch
+// does. reqwest's automatic decoder removes Content-Encoding/Content-Length.
+pub async fn read_reqwest_body_limited(
+    response: reqwest::Response,
     url: &Url,
     limit: usize,
 ) -> Result<Vec<u8>, ObscuraNetError> {
-    reject_oversized_content_length(response.headers(), url, limit)?;
-    let capacity = response
-        .content_length()
-        .and_then(|length| usize::try_from(length).ok())
-        .unwrap_or(0)
-        .min(limit);
-    let mut body = Vec::with_capacity(capacity);
-    while let Some(chunk) = response.chunk().await.map_err(|error| {
-        ObscuraNetError::Network(format!("Failed to read body: {}", error))
-    })? {
-        if chunk.len() > limit.saturating_sub(body.len()) {
+    use async_compression::tokio::bufread::{BrotliDecoder, GzipDecoder, ZlibDecoder};
+    use futures_util::TryStreamExt;
+    use tokio::io::{AsyncBufRead, AsyncBufReadExt, AsyncReadExt, BufReader};
+    use tokio_util::io::StreamReader;
+
+    let codings: Vec<String> = response.headers()
+        .get_all(reqwest::header::CONTENT_ENCODING).iter()
+        .filter_map(|v| v.to_str().ok())
+        .flat_map(|v| v.split(','))
+        .map(|v| v.trim().to_ascii_lowercase()).collect();
+    let decode = !codings.is_empty() && codings.iter().all(|v|
+        matches!(v.as_str(), "gzip" | "x-gzip" | "br" | "deflate" | "identity"));
+    if !decode {
+        reject_oversized_content_length(response.headers(), url, limit)?;
+    }
+    let stream = response.bytes_stream().map_err(std::io::Error::other);
+    let mut reader: std::pin::Pin<Box<dyn AsyncBufRead + Send>> =
+        Box::pin(StreamReader::new(stream));
+    let read_error = |error: std::io::Error|
+        ObscuraNetError::Network(format!("Failed to read body: {}", error));
+    // HEAD and no-body responses may carry representation metadata but no bytes.
+    if reader.fill_buf().await.map_err(read_error)?.is_empty() {
+        return Ok(Vec::new());
+    }
+    if decode {
+        for coding in codings.iter().rev() {
+            reader = match coding.as_str() {
+                "gzip" | "x-gzip" => {
+                    let mut decoder = GzipDecoder::new(reader);
+                    decoder.multiple_members(true);
+                    Box::pin(BufReader::new(decoder))
+                }
+                "br" => Box::pin(BufReader::new(BrotliDecoder::new(reader))),
+                "deflate" => Box::pin(BufReader::new(ZlibDecoder::new(reader))),
+                _ => reader,
+            };
+        }
+    }
+    let mut body = Vec::new();
+    let mut chunk = [0u8; 8192];
+    loop {
+        let n = reader.read(&mut chunk).await.map_err(read_error)?;
+        if n == 0 { break; }
+        if n > limit.saturating_sub(body.len()) {
             return Err(response_too_large(url, limit));
         }
-        body.extend_from_slice(&chunk);
+        body.extend_from_slice(&chunk[..n]);
     }
     Ok(body)
 }
@@ -1068,6 +1103,7 @@ impl ObscuraHttpClient {
         self.client.get_or_init(|| async {
             let mut builder = Client::builder()
                 .redirect(Policy::none())
+                .no_gzip().no_brotli().no_deflate()
                 .timeout(self.timeout)
                 .danger_accept_invalid_certs(false)
                 // Read a folded header line (obs-fold) as browsers do instead of
@@ -1560,6 +1596,11 @@ impl ObscuraHttpClient {
                 headers.remove(reqwest::header::ORIGIN);
             }
 
+            if !headers.contains_key(reqwest::header::ACCEPT_ENCODING)
+                && !headers.contains_key(reqwest::header::RANGE) {
+                headers.insert(reqwest::header::ACCEPT_ENCODING,
+                    HeaderValue::from_static("gzip, deflate, br"));
+            }
             let mut req_builder = self.get_client().await.request(method.clone(), current_url.as_str())
                 .headers(headers);
 

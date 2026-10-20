@@ -7,11 +7,11 @@ repository.workspace = true
 
 [features]
 default = []
-stealth = ["wreq", "wreq-util", "futures-util"]
+stealth = ["wreq", "wreq-util"]
 
 [dependencies]
 obscura-ssrf = { workspace = true }
-reqwest = { workspace = true }
+reqwest = { workspace = true, features = ["stream"] }
 tokio = { workspace = true }
 url = { workspace = true }
 serde = { workspace = true }
@@ -22,7 +22,9 @@ async-trait = "0.1"
 encoding_rs = "0.8"
 tempfile = "3"
 psl = "2"
-futures-util = { version = "0.3", optional = true }
+futures-util = "0.3"
+tokio-util = { version = "0.7", features = ["io"] }
+async-compression = { version = "0.4", features = ["tokio", "gzip", "brotli", "deflate", "zlib"] }
 # wreq and wreq-util are pre-release crates whose API changes between rc builds
 # (CertStore moved out of `tls`, `cert_store` renamed to `tls_cert_store`, the
 # Emulation builder reshuffled). A caret requirement let a fresh resolve pull a
