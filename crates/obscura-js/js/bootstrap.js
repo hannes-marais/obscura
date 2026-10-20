@@ -13174,6 +13174,16 @@ globalThis.HTMLImageElement = HTMLImageElement;
 globalThis.HTMLInputElement = class HTMLInputElement extends Element {
   get readOnly() { return this.hasAttribute('readonly'); }
   set readOnly(v) { if (v) this.setAttribute('readonly', ''); else this.removeAttribute('readonly'); }
+  get size() {
+    const match = /^[\t\n\f\r ]*\+?([0-9]+)/.exec(this.getAttribute('size') ?? '');
+    const value = match ? Number(match[1]) : 0;
+    return value > 0 && value <= 2147483647 ? value : 20;
+  }
+  set size(v) {
+    const value = v >>> 0;
+    if (value === 0) throw new DOMException('The size must be greater than zero.', 'IndexSizeError');
+    this.setAttribute('size', String(value <= 2147483647 ? value : 20));
+  }
 };
 // Framework value trackers read own prototype descriptors, not inherited ones.
 Object.defineProperties(HTMLInputElement.prototype, {

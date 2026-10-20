@@ -41,3 +41,28 @@ fn editable_input_value_does_not_reflect_into_its_default_attribute() {
         return [input.value, input.getAttribute('value')];
     })()"#).unwrap(), json!(["edited", "original"]));
 }
+
+#[test]
+fn input_size_reflects_positive_unsigned_attribute_with_default_twenty() {
+    let mut rt = ObscuraJsRuntime::new();
+    rt.set_dom(obscura_dom::parse_html("<body></body>"));
+    rt.run_page_init();
+    assert_eq!(rt.evaluate(r#"(() => {
+        const input = document.createElement('input');
+        const out = [input.size];
+        input.size = 10.9;
+        out.push([input.size, input.getAttribute('size')]);
+        try { input.size = 0; } catch (e) { out.push(e.name); }
+        out.push(input.getAttribute('size'));
+        const attrs = ['0', '-1', 'garbage', '2147483648', '  +12tail', '2147483647'];
+        out.push(attrs.map(value => { input.setAttribute('size', value); return input.size; }));
+        input.size = -1;
+        out.push([input.size, input.getAttribute('size')]);
+        input.size = 4294967297;
+        out.push([input.size, input.getAttribute('size')]);
+        input.removeAttribute('size');
+        out.push(input.size, 'size' in document.createElement('div'));
+        return out;
+    })()"#).unwrap(), json!([20, [10, "10"], "IndexSizeError", "10",
+        [20, 20, 20, 20, 12, 2147483647], [20, "20"], [1, "1"], 20, false]));
+}
