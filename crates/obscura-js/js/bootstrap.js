@@ -4357,6 +4357,15 @@ class Element extends Node {
   }
   get value() {
     const tag = this.localName;
+    if (tag === 'input') {
+      const type = (this.getAttribute('type') || '').toLowerCase();
+      // Default and default/on modes reflect the content attribute, even
+      // after assignment; an editable control's cached value is separate.
+      if (['radio', 'checkbox', 'hidden', 'submit', 'image', 'reset', 'button'].includes(type)) {
+        const attr = this.getAttribute('value');
+        return attr !== null ? attr : (type === 'radio' || type === 'checkbox' ? 'on' : '');
+      }
+    }
     if (tag === 'select') {
       // Selected option wins; otherwise first option (HTML default).
       const opts = this.querySelectorAll('option');
@@ -4377,12 +4386,6 @@ class Element extends Node {
     }
     if (tag === 'input') {
       const itype = (this.getAttribute('type') || '').toLowerCase();
-      if (itype === 'checkbox' || itype === 'radio') {
-        // A checkbox/radio with no value attribute defaults to "on" in a real
-        // browser, not the empty string.
-        const attr = this.getAttribute('value');
-        return attr !== null ? attr : 'on';
-      }
       if (itype === 'file') {
         // Chrome exposes a file input's value as C:\fakepath\<first filename>.
         return (this._files && this._files.length) ? ('C:\\fakepath\\' + this._files[0].name) : '';
@@ -4400,6 +4403,11 @@ class Element extends Node {
   }
   set value(v) {
     const tag = this.localName;
+    if (tag === 'input' && ['radio', 'checkbox', 'hidden', 'submit', 'image', 'reset', 'button']
+        .includes((this.getAttribute('type') || '').toLowerCase())) {
+      this.setAttribute('value', String(v));
+      return;
+    }
     if (tag === 'option') {
       this.setAttribute('value', String(v));
       return;
