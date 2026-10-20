@@ -603,19 +603,16 @@ fn css_resource_urls(css: &str, base: &url::Url) -> Vec<String> {
         }
         // `@import url(...)` is a stylesheet dependency, not a paint asset.
         // It is fetched by the bounded stylesheet graph above. Letting the
-        // generic image/font warmup rediscover it issues a second request with
+        // generic image warmup rediscover it issues a second request with
         // the wrong ResourceType::Image classification.
         if let Some(length) = css_import_rule_len(rest) {
             index += length;
             continue;
         }
-        // A `@font-face` `src` list is a priority order, not a set of
-        // resources. Scanning it generically warms every entry of every
-        // descriptor; the renderer considers far fewer. `css_font_face_rule`
-        // collects the ones it will consider and reports the whole block as
-        // consumed, the same shape as the `@import` skip above.
-        if let Some((length, sources)) = css_font_face_rule(rest, base) {
-            urls.extend(sources);
+        // Font declarations are not demand. The native cascade/shaper queues
+        // selected faces; preserve source priority there instead of warming
+        // every unused family before layout.
+        if let Some((length, _)) = css_font_face_rule(rest, base) {
             index += length;
             continue;
         }
@@ -3845,6 +3842,11 @@ impl Page {
                 sources
             })
             .unwrap_or_default();
+        if css_sources.iter().any(|css| css.to_ascii_lowercase().contains("@font-face")) {
+            // One cache-only native cascade discovers document text demand
+            // and explicit preloads; misses use the normal async loader.
+            js.discover_font_resources();
+        }
         for css in css_sources {
             for raw in css_resource_urls(&css, &base_url) {
                 if let Ok(mut url) = url::Url::parse(&raw) {
@@ -5005,6 +5007,7 @@ impl Drop for Page {
 #[cfg(test)]
 mod tests {
     use super::{
+        css_font_face_rule,
         css_resource_urls, linked_stylesheet_requests, materialize_stylesheet_graph,
         navigation_chain_limit_from_env_value, navigation_referrer,
         navigation_timeout_from_env_value, parse_import_url, rebase_css_urls,
@@ -5430,13 +5433,14 @@ mod tests {
             }
         "#;
         assert_eq!(
-            css_resource_urls(css, &base),
+            css_font_face_rule(css.trim_start(), &base).unwrap().1,
             vec![
                 "https://example.test/font/probe.woff2".to_string(),
                 "https://example.test/font/probe.woff".to_string(),
                 "https://example.test/font/probe.ttf".to_string(),
             ]
         );
+        assert!(css_resource_urls(css, &base).is_empty(), "declarations alone are not demand");
     }
 
     #[test]
@@ -5455,10 +5459,11 @@ mod tests {
         assert_eq!(
             css_resource_urls(css, &base),
             vec![
-                "https://example.test/css/probe.woff2".to_string(),
                 "https://example.test/img/hero.png".to_string(),
             ]
         );
+        assert_eq!(css_font_face_rule(css.trim_start(), &base).unwrap().1,
+            vec!["https://example.test/css/probe.woff2".to_string()]);
     }
 
     #[test]
@@ -5475,10 +5480,11 @@ mod tests {
         assert_eq!(
             css_resource_urls(css, &base),
             vec![
-                "https://example.test/css/fallback.woff".to_string(),
                 "https://example.test/css/after.png".to_string(),
             ]
         );
+        assert_eq!(css_font_face_rule(css.trim_start(), &base).unwrap().1,
+            vec!["https://example.test/css/fallback.woff".to_string()]);
     }
 
     #[test]
@@ -9498,7 +9504,7 @@ mod tests {
                 let (content_type, body): (&str, &[u8]) = match path.as_str() {
                     "/page" => (
                         "text/html",
-                        br#"<!doctype html><html><head></head><body><script>
+                        br#"<!doctype html><html><head></head><body><p>Dynamic font text</p><script>
                             const image = document.createElement('img');
                             image.src = '/dynamic.svg';
                             document.body.appendChild(image);

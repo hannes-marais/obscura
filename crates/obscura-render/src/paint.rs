@@ -24,7 +24,6 @@ static FONT_BOLD_OBLIQUE_BYTES: &[u8] = include_bytes!("../assets/liberation-san
 
 use crate::dom::{
     RetainedStyleMaps, layout_dom_with_query_seed,
-    layout_dom_with_web_fonts_and_stylesheet_cache_for_media_with_animation_state,
 };
 
 const DEFAULT_RESOURCE_CACHE_ENTRIES: usize = 512;
@@ -3058,22 +3057,24 @@ fn prepare_dom_with_dynamic_fonts_and_stylesheet_cache_internal(
         .collect::<HashMap<_, _>>();
     let seeded_content_images =
         resources.seed_content_image_intrinsics(tree, &mut intrinsic, &mut selected_images);
-    let fonts = collect_web_fonts(tree, base_url, resources, dynamic_fonts);
-    // Most framework pages use web fonts and many decorative SVG icons, but
-    // only SVG text needs the page font faces. Avoid cloning/loading the page
-    // font database for ordinary icons and HTML-only text.
-    let svg_fonts = if has_inline_svg_text(tree) {
-        svg_font_database_with_web_fonts(&fonts)
-    } else {
-        svg_font_database()
+    let mut fonts = Vec::new();
+    let mut previous_demand = None;
+    let mut resolve_fonts = |styles: &HashMap<_, crate::LayoutStyle>| {
+        let demand = rendered_font_families(tree, styles);
+        if previous_demand.as_ref() != Some(&demand) {
+            fonts = collect_web_fonts_for_demand(tree, base_url, resources, dynamic_fonts, Some(&demand));
+            previous_demand = Some(demand);
+        }
+        fonts.clone()
     };
     let (retained, mutations) = retained.map_or((None, &[][..]), |(styles, mutations)| {
         (Some(styles), mutations)
     });
     let mut laid = layout_dom_with_query_seed(
-        tree, viewport, &intrinsic, &fonts, stylesheet_cache, retained, mutations,
-        media_type, animation_sample, animation_timeline, &mut query_seed,
+        tree, viewport, &intrinsic, &[], stylesheet_cache, retained, mutations,
+        media_type, animation_sample, animation_timeline, &mut query_seed, Some(&mut resolve_fonts),
     );
+    drop(resolve_fonts);
     // `content:url(...)` is computed by the author cascade, whereas ordinary
     // HTML image sources are available before layout. Pay for a second layout
     // only on the uncommon pages that actually use a CSS image as replaced
@@ -3097,17 +3098,26 @@ fn prepare_dom_with_dynamic_fonts_and_stylesheet_cache_internal(
         // cache together with the provisional layout; the next prepare may
         // populate it again from a complete cascade.
         query_seed = None;
-        laid = layout_dom_with_web_fonts_and_stylesheet_cache_for_media_with_animation_state(
-            tree,
-            viewport,
-            &intrinsic,
-            &fonts,
-            stylesheet_cache,
-            media_type,
-            animation_sample,
-            animation_timeline,
+        let mut resolve_fonts = |styles: &HashMap<_, crate::LayoutStyle>| {
+            let demand = rendered_font_families(tree, styles);
+            if previous_demand.as_ref() != Some(&demand) {
+                fonts = collect_web_fonts_for_demand(tree, base_url, resources, dynamic_fonts, Some(&demand));
+                previous_demand = Some(demand);
+            }
+            fonts.clone()
+        };
+        laid = layout_dom_with_query_seed(
+            tree, viewport, &intrinsic, &[], stylesheet_cache, None, &[],
+            media_type, animation_sample, animation_timeline, &mut query_seed, Some(&mut resolve_fonts),
         );
+        // A correction layout cannot retain the provisional image provenance.
+        query_seed = None;
     }
+    let svg_fonts = if has_inline_svg_text(tree) {
+        svg_font_database_with_web_fonts(&fonts)
+    } else {
+        svg_font_database()
+    };
     let derived = laid.derived_layout_state(tree, viewport);
     let root_font_size = tree
         .query_selector("html")
@@ -7614,11 +7624,86 @@ fn resolve_resource_url(src: &str, base_url: Option<&str>) -> Option<String> {
 /// filtering is load-bearing for performance: generated font packages commonly
 /// emit six or seven script subsets per face, while an English page needs only
 /// the subset containing ASCII.
+#[cfg(test)]
 fn collect_web_fonts(
     tree: &DomTree,
     base_url: Option<&str>,
     cache: &mut RenderResourceCache,
     dynamic_fonts: &[DynamicFontFace],
+) -> Vec<crate::inline::WebFont> {
+    collect_web_fonts_for_demand(tree, base_url, cache, dynamic_fonts, None)
+}
+
+/// Queue actual font demand during navigation without laying out the document.
+/// The caller supplies a cache-only resource loader backed by its page transport.
+pub fn discover_font_resources(
+    tree: &DomTree,
+    viewport: (f32, f32),
+    base_url: Option<&str>,
+    cache: &mut RenderResourceCache,
+    dynamic_fonts: &[DynamicFontFace],
+    stylesheet_cache: &mut crate::css::StylesheetCache,
+    media_type: crate::CssMediaType,
+    animation_sample: crate::AnimationSample,
+    timeline: &crate::AnimationTimelineState,
+) {
+    let styles = crate::dom::font_demand_styles(tree, viewport, media_type,
+        stylesheet_cache, animation_sample, timeline);
+    let demand = rendered_font_families(tree, &styles);
+    let _ = collect_web_fonts_for_demand(tree, base_url, cache, dynamic_fonts, Some(&demand));
+}
+
+fn rendered_font_families(
+    tree: &DomTree,
+    styles: &HashMap<obscura_dom::tree::NodeId, crate::LayoutStyle>,
+) -> std::collections::HashSet<String> {
+    fn add(out: &mut std::collections::HashSet<String>, family: Option<&str>) {
+        if let Some(family) = family {
+            for name in split_css_top_level(family, ',') {
+                out.insert(name.trim().trim_matches(['\'', '"']).to_ascii_lowercase());
+            }
+        }
+    }
+    let mut demanded = std::collections::HashSet::new();
+    let mut families = HashMap::new();
+    let mut hidden = std::collections::HashSet::new();
+    for id in crate::dom::rendered_descendants(tree, tree.document()) {
+        let parent = crate::dom::rendered_parent(tree, id);
+        let style = styles.get(&id);
+        if parent.is_some_and(|parent| hidden.contains(&parent))
+            || style.is_some_and(|style| style.display == crate::Display::None)
+        {
+            hidden.insert(id);
+            continue;
+        }
+        let family = style.and_then(|style| style.font_family.as_deref())
+            .or_else(|| parent.and_then(|parent| families.get(&parent).copied()));
+        let has_text = tree.with_node(id, |node| match &node.data {
+            obscura_dom::tree::NodeData::Text { contents } => !contents.is_empty(),
+            _ => node.as_element().is_some_and(|element|
+                matches!(element.local.as_ref(), "input" | "textarea" | "select" | "li")),
+        }).unwrap_or(false);
+        if has_text { add(&mut demanded, family); }
+        if let Some(style) = style {
+            for (content, pseudo) in [(&style.before_content, &style.before_pseudo),
+                                     (&style.after_content, &style.after_pseudo)] {
+                if content.as_ref().is_some_and(|content| !content.is_empty()) {
+                    add(&mut demanded, pseudo.as_ref().and_then(|style| style.font_family.as_deref())
+                        .or(family));
+                }
+            }
+        }
+        if let Some(family) = family { families.insert(id, family); }
+    }
+    demanded
+}
+
+fn collect_web_fonts_for_demand(
+    tree: &DomTree,
+    base_url: Option<&str>,
+    cache: &mut RenderResourceCache,
+    dynamic_fonts: &[DynamicFontFace],
+    demand: Option<&std::collections::HashSet<String>>,
 ) -> Vec<crate::inline::WebFont> {
     struct FontRule {
         sources: Vec<(String, String)>,
@@ -7729,6 +7814,10 @@ fn collect_web_fonts(
     for rule in rules {
         if fonts.len() >= 16 {
             break;
+        }
+        if demand.is_some_and(|demand| rule.family.as_ref().is_some_and(|family|
+            !demand.contains(&family.to_ascii_lowercase()))) {
+            continue;
         }
         for (key, src) in rule.sources {
             if !seen.insert(key) {

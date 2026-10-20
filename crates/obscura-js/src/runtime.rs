@@ -1866,6 +1866,22 @@ impl ObscuraJsRuntime {
         })
     }
 
+    /// Discover text font requests without constructing Taffy/paint geometry.
+    #[cfg(feature = "render")]
+    pub fn discover_font_resources(&self) {
+        let mut state = self.state.borrow_mut();
+        let base_url = document_base_url(&state);
+        with_sync_render_loading_disabled(&mut state, |state| {
+            let ObscuraState { dom, viewport, render_resources, dynamic_fonts,
+                stylesheet_cache, render_media, animation_sample, animation_timeline, .. } = state;
+            if let Some(dom) = dom {
+                obscura_render::discover_font_resources(dom, *viewport, base_url.as_deref(),
+                    render_resources, dynamic_fonts, stylesheet_cache, *render_media,
+                    *animation_sample, animation_timeline);
+            }
+        });
+    }
+
     /// Return the exact responsive candidates selected for live `<img>`
     /// elements and `<video poster>` resources without loading them. The
     /// browser layer can then fetch them concurrently through the page-owned

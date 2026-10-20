@@ -2424,6 +2424,11 @@ fn legacy_font_size_hint(value: &str) -> Option<&'static str> {
 /// Apply HTML presentational attributes at their cascade origin: above the UA
 /// defaults, but below every author stylesheet and style attribute.
 fn apply_presentational_hints(node: &obscura_dom::tree::Node, style: &mut crate::LayoutStyle) {
+    if node.as_element().is_some_and(|name| name.ns.as_ref() == "http://www.w3.org/2000/svg") {
+        if let Some(family) = node.get_attribute("font-family") {
+            crate::style::apply_inline(style, &format!("font-family: {family}"));
+        }
+    }
     if node.as_element().is_some_and(|name| {
         name.local.as_ref() == "font" && name.ns.as_ref() == "http://www.w3.org/1999/xhtml"
     }) {
@@ -2896,6 +2901,7 @@ fn cascade_walk(
     inherited_cell_padding: Option<f32>,
     inherited_color_scheme_dark: bool,
     fresh_styles: Option<&HashSet<NodeId>>,
+    needed: Option<&HashSet<NodeId>>,
 ) {
     #[derive(Clone, Copy, PartialEq, Eq)]
     enum MatcherBase {
@@ -2952,6 +2958,9 @@ fn cascade_walk(
                 subtree_matchers.pop();
             }
             Work::Visit(visit) => {
+                if needed.is_some_and(|needed| !needed.contains(&visit.id)) {
+                    continue;
+                }
                 if visit.matcher_base != MatcherBase::Incremental {
                     let mut fresh = tree.matcher();
                     if visit.matcher_base == MatcherBase::FreshFromAncestors {
@@ -4511,6 +4520,50 @@ fn collect_shadow_stylesheets(
         .collect()
 }
 
+/// Resolve font demand without building geometry for empty document branches.
+/// Conditional container fonts remain the resource-aware layout's responsibility.
+#[cfg(feature = "paint")]
+pub(crate) fn font_demand_styles(
+    tree: &DomTree,
+    viewport: (f32, f32),
+    media_type: crate::CssMediaType,
+    cache: &mut crate::css::StylesheetCache,
+    animation_sample: crate::AnimationSample,
+    timeline: &crate::AnimationTimelineState,
+) -> HashMap<NodeId, crate::LayoutStyle> {
+    let sources = document_stylesheet_sources(tree, viewport, media_type);
+    let (sheet, _) = cache.get_or_parse(tree, &sources, viewport, media_type);
+    let shadow_sheets = collect_shadow_stylesheets(tree, viewport, media_type);
+    let generated = sheet.has_generated_content_rules()
+        || shadow_sheets.values().any(|sheet| sheet.has_generated_content_rules());
+    let mut needed = HashSet::new();
+    for id in rendered_descendants(tree, tree.document()) {
+        let relevant = tree.with_node(id, |node| match &node.data {
+            obscura_dom::tree::NodeData::Text { contents } => !contents.is_empty(),
+            _ => node.as_element().is_some_and(|element| generated
+                || matches!(element.local.as_ref(), "input" | "textarea" | "select" | "li")),
+        }).unwrap_or(false);
+        if relevant {
+            let mut current = Some(id);
+            while let Some(node) = current {
+                if !needed.insert(node) { break; }
+                current = rendered_parent(tree, node);
+            }
+        }
+    }
+    let mut styles = HashMap::new();
+    if needed.is_empty() { return styles; }
+    let quirks = !tree.children(tree.document()).iter().any(|node|
+        tree.borrow_node(*node).is_some_and(|node|
+            matches!(node.data, obscura_dom::tree::NodeData::Doctype { .. })));
+    cascade_walk(tree, tree.document(), &sheet, &sheet, &shadow_sheets,
+        &mut tree.matcher(), &mut styles, &mut HashMap::new(),
+        &std::rc::Rc::new(HashMap::new()), &mut None, quirks, viewport,
+        animation_sample, &mut timeline.clone(), None, false, None, Some(&needed));
+    resolve_css_counters(tree, &mut styles);
+    styles
+}
+
 /// Resolve frequently read non-geometric CSSOM values along one ancestor path.
 /// This does not consume layout damage or mutate animation history. Unsupported
 /// dependencies return None so callers use the ordinary resource-aware layout.
@@ -4665,7 +4718,7 @@ fn layout_dom_with_web_fonts_pass_limit_at_animation_time(
 ) -> (DomLayout, ContainerLayoutTelemetry) {
     layout_dom_with_web_fonts_pass_limit_and_query_seed(
         tree, viewport, intrinsic, fonts, pass_limit, stylesheet_cache, retained,
-        mutations, media_type, animation_sample, animation_timeline, None,
+        mutations, media_type, animation_sample, animation_timeline, None, None,
     )
 }
 
@@ -4681,10 +4734,11 @@ pub(crate) fn layout_dom_with_query_seed(
     animation_sample: crate::AnimationSample,
     animation_timeline: &mut crate::AnimationTimelineState,
     query_seed: &mut Option<RetainedStyleMaps>,
+    font_resolver: Option<&mut dyn FnMut(&HashMap<NodeId, crate::LayoutStyle>) -> Vec<crate::inline::WebFont>>,
 ) -> DomLayout {
     layout_dom_with_web_fonts_pass_limit_and_query_seed(
         tree, viewport, intrinsic, fonts, None, Some(stylesheet_cache), retained,
-        mutations, media_type, animation_sample, animation_timeline, Some(query_seed),
+        mutations, media_type, animation_sample, animation_timeline, Some(query_seed), font_resolver,
     ).0
 }
 
@@ -4701,6 +4755,7 @@ fn layout_dom_with_web_fonts_pass_limit_and_query_seed(
     animation_sample: crate::AnimationSample,
     animation_timeline: &mut crate::AnimationTimelineState,
     mut query_seed: Option<&mut Option<RetainedStyleMaps>>,
+    mut font_resolver: Option<&mut dyn FnMut(&HashMap<NodeId, crate::LayoutStyle>) -> Vec<crate::inline::WebFont>>,
 ) -> (DomLayout, ContainerLayoutTelemetry) {
     let timing = std::env::var("OBSCURA_RENDER_TIMING").is_ok();
 
@@ -4827,6 +4882,7 @@ fn layout_dom_with_web_fonts_pass_limit_and_query_seed(
             retained,
             animation_sample,
             animation_timeline,
+            &mut font_resolver,
         );
     if !sheet.has_container_queries() {
         if timing {
@@ -4955,6 +5011,7 @@ fn layout_dom_with_web_fonts_pass_limit_and_query_seed(
                 None,
                 animation_sample,
                 animation_timeline,
+                &mut font_resolver,
             );
         passes = pass;
         query.evaluations += pass_query.evaluations;
@@ -5029,6 +5086,7 @@ fn layout_dom_with_web_fonts_pass_limit_and_query_seed(
                 None,
                 animation_sample,
                 animation_timeline,
+                &mut font_resolver,
             );
         laid = fallback;
         passes += 1;
@@ -5085,6 +5143,7 @@ fn layout_dom_once(
     retained: Option<(RetainedStyleMaps, HashSet<NodeId>)>,
     animation_sample: crate::AnimationSample,
     animation_timeline: &mut crate::AnimationTimelineState,
+    font_resolver: &mut Option<&mut dyn FnMut(&HashMap<NodeId, crate::LayoutStyle>) -> Vec<crate::inline::WebFont>>,
 ) -> (
     DomLayout,
     Option<crate::css::ContainerDecisionSignature>,
@@ -5129,6 +5188,7 @@ fn layout_dom_once(
         None,
         false,
         fresh_styles.as_ref(),
+        None,
     );
     resolve_css_counters(tree, &mut styles);
     let cascade_time = t1.elapsed();
@@ -5140,6 +5200,11 @@ fn layout_dom_once(
         },
     );
     grow_trailing_auto_cells(tree, &mut styles);
+
+    // Resolve authored faces from this pass's actual cascade before shaping.
+    // The renderer can queue misses without a duplicate preliminary layout.
+    let resolved_fonts = font_resolver.as_mut().map(|resolve| resolve(&styles));
+    let fonts = resolved_fonts.as_deref().unwrap_or(fonts);
 
     let descendants = tree.descendants(tree.document());
     let needs_emoji_font = descendants.iter().any(|id| {

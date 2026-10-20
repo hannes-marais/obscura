@@ -2515,6 +2515,9 @@ impl StylesheetCache {
 }
 
 impl Stylesheet {
+    pub(crate) fn has_generated_content_rules(&self) -> bool {
+        !self.before_rules.rules.is_empty() || !self.after_rules.rules.is_empty()
+    }
     /// Dependency metadata for conservative incremental-style invalidation.
     /// Building this map does not itself enable incremental cascade skipping.
     pub fn invalidation_map(&self) -> &InvalidationMap {
