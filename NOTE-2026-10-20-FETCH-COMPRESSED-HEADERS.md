@@ -1,0 +1,11 @@
+2026-10-20
+
+# Compressed fetch response headers
+
+Observed QA157 strict source/body identity passes on Chromium and Obscura, but exported Content-Encoding differs. Do not suppress that discrepancy or relabel an aggregate pass.
+
+Source trace: obscura-net client.rs copies response headers after reqwest automatic gzip/brotli/deflate decoding. Automatic decoding may remove Content-Encoding/Content-Length. Browser fetch exposes response representation headers while delivering decoded bytes. Confirm with one deterministic HTTP fixture sending identical gzip bytes/headers to both engines before choosing a repair. Differing negotiated responses alone would not prove a browser defect.
+
+Plan: serve a local gzip response unconditionally, retain actual request/response/body receipts and both-engine results; no real QA mutation. If confirmed, preserve wire metadata while retaining decoded-body limits, redirect/CORS behavior and performance. Do not disable decoding without implementing equivalent bounded decoding. Validation for any eventual code: focused release nextest, full release nextest, managed render build and33obstacles. Risks: double decoding, decompression expansion bypass, misleading length, stealth transport inconsistency. ToQ: exact transport metadata/body boundary; ToT: preserve normal browser Fetch semantics without URL-specific patches. No code change yet.
+
+Deterministic result: fixture server45869/session36493 always sends gzip54bytes,SHA f95581208a4e4af3966afe148ba136d7d15a1fc923411dd32714570a57ae0845. Both engines decode compressed-header-fixture-20261020. Chromium output exposes encoding=gzip,length=54; Obscura exposes null/null. Actual server request/response receipts prove identical payload; different Accept-Encoding requests cannot explain the result. WebPilot exits2 engine-divergence, each body check passes. Evidence /home/oumy/appgen-build/decker-cps/dist/evidence/gzip-header-repro-20261020; server log /tmp/fdevbox-gzip-header-server-20261020.jsonl; fixture and test /tmp/fdevbox-gzip-header-fixture-20261020.{py,webpilot}. No code changes. Owning repair must retain wire headers and bounded decoded-body behavior across gzip/brotli/deflate; avoid replacing the diagnostic with a header-insensitive pass.
