@@ -2217,7 +2217,9 @@ fn auto_width_flex_button_keeps_native_intrinsic_sizing() {
     assert!(
         button.width > 120.0
             && button.width < 220.0
-            && (button.x - (600.0 - button.width) / 2.0).abs() < 0.01,
+            // Layout rects are device-pixel rounded. Odd widths therefore
+            // place a centered box at the nearest pixel, rather than .5px.
+            && (button.x - ((600.0 - button.width) / 2.0).round()).abs() < 0.01,
         "the auto-width flex button should shrink-wrap and center: {button:?}"
     );
 }

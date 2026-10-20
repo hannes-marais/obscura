@@ -1492,6 +1492,17 @@ impl TextEngine {
         Some(index)
     }
 
+    /// Measure a label with the same selected font and shaping as its paint.
+    /// The temporary context has no layout/paint owner and must not survive
+    /// this intrinsic-size query.
+    pub(crate) fn measure_intrinsic_label(&mut self, text: &str, style: &LayoutStyle) -> Option<f32> {
+        let index = self.push_generated_text(text, style)?;
+        let width = self.measure(index, None).0;
+        debug_assert_eq!(index + 1, self.items.len());
+        self.items.pop();
+        Some(width)
+    }
+
     /// Shape generated text that owns a positioned pseudo box.
     ///
     /// Positioned `::before`/`::after` boxes do not participate in the taffy

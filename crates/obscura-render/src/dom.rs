@@ -6415,6 +6415,10 @@ fn layout_dom_once(
                     style.font_family.as_deref(),
                     style.letter_spacing.unwrap_or(0.0),
                 );
+                #[cfg(feature = "paint")]
+                if let Some(width) = engine.measure_intrinsic_label(&label, style) {
+                    content_width = width;
+                }
                 content_width += intrinsic_content
                     .map(|content| content.atomic_width)
                     .unwrap_or(0.0);
@@ -16046,6 +16050,22 @@ mod tests {
             "children heights should be 40 and 60, got {:?}",
             sorted
         );
+    }
+
+    #[cfg(feature = "paint")]
+    #[test]
+    fn system_font_fit_content_buttons_keep_short_labels_on_one_line() {
+        let tree = parse_html(r#"<style>
+            .row{display:flex;justify-content:flex-end;width:560px}
+            button{display:inline-flex;width:fit-content;box-sizing:border-box;align-items:center;justify-content:center;gap:8px;font:600 14px/1 system-ui;border:1px solid transparent;min-height:36px;padding:7px 15px}
+            .copy{display:inline-flex;min-width:0;flex-direction:column;align-items:flex-start;gap:2px}
+            </style><div class="row"><button id="nested"><span class="copy"><span>Use selected</span></span></button></div>
+            <div class="row"><button id="plain">Report an issue</button></div>"#);
+        let laid = layout_dom(&tree, (1280.0, 800.0));
+        for id in ["nested", "plain"] {
+            let rect = laid.rects[&tree.get_element_by_id(id).unwrap()];
+            assert!((rect.height - 36.0).abs() < 0.5, "{id}: {rect:?}");
+        }
     }
 
     #[cfg(feature = "paint")]
