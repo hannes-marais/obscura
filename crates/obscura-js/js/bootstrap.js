@@ -6,6 +6,14 @@
 // after deno_core finishes binding ops and before any page script runs. All
 // browser APIs below close over this reference.
 const __obscuraCore = globalThis.Deno.core;
+let _flushResourceTimings = () => {};
+async function _fetchResourceWithTiming(...args) {
+  try {
+    return await __obscuraCore.ops.op_fetch_url(...args);
+  } finally {
+    _flushResourceTimings();
+  }
+}
 
 // Pre-declare all internal globals as non-enumerable so they are invisible
 // to Object.keys(window) / for-in enumeration. Must run before any var
@@ -389,7 +397,7 @@ async function __fetchDynClassicScript(task) {
   if (task.url.startsWith('data:')) {
     body = _decodeDataScriptUrl(task.url);
   } else {
-    const raw = await __obscuraCore.ops.op_fetch_url(
+    const raw = await _fetchResourceWithTiming(
       task.url, "GET", "{}", new Uint8Array(0), task.pageOrigin, "no-cors", "same-origin", "Script"
     );
     const parsed = JSON.parse(raw);
@@ -625,7 +633,7 @@ async function _fetchLinkedCss(url, pageOrigin, depth = 0, seen = new Set()) {
     return { css: "", responseUrl: url, originClean: true };
   }
   seen.add(url);
-  const raw = await __obscuraCore.ops.op_fetch_url(
+  const raw = await _fetchResourceWithTiming(
     url, "GET", "{}", new Uint8Array(0), pageOrigin, "no-cors", "same-origin", "Stylesheet"
   );
   const parsed = JSON.parse(raw);
@@ -4700,7 +4708,7 @@ class Element extends Node {
     const el = this;
     let pageOrigin = '';
     try { pageOrigin = new URL(_domParse('document_url') || 'about:blank').origin; } catch (_) {}
-    __obscuraCore.ops.op_fetch_url(
+    _fetchResourceWithTiming(
       fullUrl, 'GET', '{}', new Uint8Array(0), pageOrigin,
       'no-cors', 'same-origin', 'Document'
     ).then(raw => {
@@ -7928,10 +7936,12 @@ async function _fetch(input, init = {}, resourceType = "Fetch") {
       signal ? { cancel_rid: cancelRid, destination: resourceType } : resourceType);
   } catch (error) {
     cleanup();
+    _flushResourceTimings();
     throw signalState && signalState.aborted ? signalState.reason : error;
   }
   if (signalState && signalState.aborted) { cleanup(); throw signalState.reason; }
   const parsed = JSON.parse(raw);
+  _flushResourceTimings();
   if (parsed.blocked) {
     cleanup();
     const err = new TypeError('net::ERR_FAILED');
@@ -7961,7 +7971,10 @@ async function _fetch(input, init = {}, resourceType = "Fetch") {
     // ponytail: preserve bounded one-chunk bodies; incremental delivery needs
     // stream backpressure rather than eagerly queuing every network chunk.
     const promise = __obscuraCore.ops.op_fetch_body(parsed.bodyRid)
-      .catch(error => { throw signalState && signalState.aborted ? signalState.reason : error; })
+      .then(bytes => { _flushResourceTimings(); return bytes; }, error => {
+        _flushResourceTimings();
+        throw signalState && signalState.aborted ? signalState.reason : error;
+      })
       .finally(cleanup);
     promise.catch(() => {}); // An unread/cancelled body must not report an unhandled rejection.
     response._fetchBody = { promise, resource: { rid: parsed.bodyRid, consumers: 1 } };
@@ -11857,14 +11870,16 @@ globalThis.performance = globalThis.performance || {
     constructor() { throw new TypeError('Illegal constructor'); }
   };
   Object.setPrototypeOf(perf, Performance.prototype);
-  const buffers = Object.assign(Object.create(null), {mark: [], measure: []});
+  const buffers = Object.assign(Object.create(null), {mark: [], measure: [], resource: []});
   const latestMarks = new Map();
   const entryState = new WeakMap();
   const observerState = new WeakMap();
   const listState = new WeakMap();
   const observers = new Set();
   const entryKey = {};
-  const supported = Object.freeze(['mark', 'measure']);
+  const supported = Object.freeze(['mark', 'measure', 'resource']);
+  let resourceLimit = 250, resourceOverflow = [], resourceFullPending = false;
+  let resourceDropped = 0;
   const timingNames = new Set([
     'navigationStart', 'unloadEventStart', 'unloadEventEnd', 'redirectStart', 'redirectEnd',
     'fetchStart', 'domainLookupStart', 'domainLookupEnd', 'connectStart', 'connectEnd',
@@ -11915,7 +11930,7 @@ globalThis.performance = globalThis.performance || {
       return (name === undefined || data.name === name) && (type === undefined || data.entryType === type);
     }).sort((a, b) => entryState.get(a).startTime - entryState.get(b).startTime);
   }
-  function allEntries() { return buffers.mark.concat(buffers.measure); }
+  function allEntries() { return buffers.mark.concat(buffers.measure, buffers.resource); }
   function checkPerformance(receiver) {
     if (receiver !== perf) throw new TypeError('Illegal invocation');
   }
@@ -11958,6 +11973,49 @@ globalThis.performance = globalThis.performance || {
       return data.detail;
     }
   };
+  const resourceFields = ['initiatorType', 'nextHopProtocol', 'workerStart', 'redirectStart', 'redirectEnd',
+    'fetchStart', 'domainLookupStart', 'domainLookupEnd', 'connectStart', 'connectEnd',
+    'secureConnectionStart', 'requestStart', 'responseStart', 'responseEnd',
+    'transferSize', 'encodedBodySize', 'decodedBodySize', 'responseStatus'];
+  globalThis.PerformanceResourceTiming = class PerformanceResourceTiming extends PerformanceEntry {
+    constructor() { throw new TypeError('Illegal constructor'); }
+    toJSON() {
+      const data = state(entryState, this);
+      if (data.entryType !== 'resource') throw new TypeError('Illegal invocation');
+      const result = {name: data.name, entryType: data.entryType, startTime: data.startTime, duration: data.duration};
+      for (const field of resourceFields) result[field] = data[field];
+      return result;
+    }
+  };
+  for (const field of resourceFields) Object.defineProperty(PerformanceResourceTiming.prototype, field, {
+    configurable: true, enumerable: true, get() {
+      const data = state(entryState, this);
+      if (data.entryType !== 'resource') throw new TypeError('Illegal invocation');
+      return data[field];
+    },
+  });
+  function scheduleResourceFull() {
+    if (resourceFullPending) return;
+    resourceFullPending = true;
+    _browserPostedTaskEnqueue(() => {
+      perf.dispatchEvent(new Event('resourcetimingbufferfull'));
+      while (resourceOverflow.length && buffers.resource.length < resourceLimit)
+        buffers.resource.push(resourceOverflow.shift());
+      resourceDropped += resourceOverflow.length;
+      resourceOverflow = [];
+      resourceFullPending = false;
+    }, 0, _browserPostedTaskGeneration(), () => {
+      resourceOverflow = []; resourceFullPending = false;
+    });
+  }
+  _flushResourceTimings = () => {
+    for (const data of JSON.parse(_dom('performance_resource_entries'))) {
+      const entry = Object.create(PerformanceResourceTiming.prototype);
+      for (const field of resourceFields) if (data[field] === undefined) data[field] = field === 'nextHopProtocol' ? '' : 0;
+      entryState.set(entry, data);
+      record(entry);
+    }
+  };
   function queueDelivery() {
     if (deliveryPending) return;
     deliveryPending = true;
@@ -11971,7 +12029,8 @@ globalThis.performance = globalThis.performance || {
         const list = Object.create(PerformanceObserverEntryList.prototype);
         listState.set(list, data.records);
         data.records = [];
-        const options = data.requiresDroppedEntries ? {droppedEntriesCount: 0} : {};
+        const options = data.requiresDroppedEntries
+          ? {droppedEntriesCount: data.types.has('resource') ? resourceDropped - data.droppedStart : 0} : {};
         data.requiresDroppedEntries = false;
         try { data.callback.call(observer, list, observer, options); }
         catch (error) { globalThis.reportError(error); }
@@ -11983,7 +12042,10 @@ globalThis.performance = globalThis.performance || {
   }
   function record(entry) {
     const data = entryState.get(entry);
-    buffers[data.entryType].push(entry);
+    if (data.entryType === 'resource' && buffers.resource.length >= resourceLimit) {
+      resourceOverflow.push(entry);
+      scheduleResourceFull();
+    } else buffers[data.entryType].push(entry);
     if (data.entryType === 'mark') {
       const previous = latestMarks.get(data.name);
       if (!previous || entryState.get(previous).startTime <= data.startTime) latestMarks.set(data.name, entry);
@@ -12043,15 +12105,45 @@ globalThis.performance = globalThis.performance || {
   }
   perf.clearMarks = function clearMarks(name = undefined) { checkPerformance(this); clear('mark', name); };
   perf.clearMeasures = function clearMeasures(name = undefined) { checkPerformance(this); clear('measure', name); };
-  perf.getEntries = function getEntries() { checkPerformance(this); return entries(allEntries()); };
+  perf.clearResourceTimings = function clearResourceTimings() {
+    checkPerformance(this); _flushResourceTimings(); buffers.resource = [];
+  };
+  perf.setResourceTimingBufferSize = function setResourceTimingBufferSize(size) {
+    checkPerformance(this);
+    if (!arguments.length) throw new TypeError('A buffer size is required');
+    resourceLimit = Number(size) >>> 0;
+  };
+  perf.addEventListener = function addEventListener(type, callback, options) {
+    checkPerformance(this); _eventTargetAdd(this, type, callback, options);
+  };
+  perf.removeEventListener = function removeEventListener(type, callback, options) {
+    checkPerformance(this); _eventTargetRemove(this, type, callback, options);
+  };
+  perf.dispatchEvent = function dispatchEvent(event) {
+    checkPerformance(this); return _eventTargetDispatch(this, event);
+  };
+  let resourceFullHandler = null;
+  Object.defineProperty(perf, 'onresourcetimingbufferfull', {
+    configurable: true, enumerable: true,
+    get() { checkPerformance(this); return resourceFullHandler; },
+    set(callback) {
+      checkPerformance(this);
+      if (resourceFullHandler) _eventTargetRemove(perf, 'resourcetimingbufferfull', resourceFullHandler);
+      resourceFullHandler = typeof callback === 'function' ? callback : null;
+      if (resourceFullHandler) _eventTargetAdd(perf, 'resourcetimingbufferfull', resourceFullHandler);
+    },
+  });
+  perf.getEntries = function getEntries() { checkPerformance(this); _flushResourceTimings(); return entries(allEntries()); };
   perf.getEntriesByType = function getEntriesByType(type) {
     checkPerformance(this);
     if (!arguments.length) throw new TypeError('An entry type is required');
+    _flushResourceTimings();
     type = string(type);
     return entries(buffers[type] || []);
   };
   perf.getEntriesByName = function getEntriesByName(name, type = undefined) {
     checkPerformance(this);
+    _flushResourceTimings();
     if (!arguments.length) throw new TypeError('An entry name is required');
     return entries(allEntries(), string(name), type === undefined ? undefined : string(type));
   };
@@ -12072,10 +12164,12 @@ globalThis.performance = globalThis.performance || {
   globalThis.PerformanceObserver = class PerformanceObserver {
     constructor(callback) {
       if (typeof callback !== 'function') throw new TypeError('An observer callback is required');
-      observerState.set(this, {callback, records: [], types: new Set(), mode: undefined, requiresDroppedEntries: false});
+      observerState.set(this, {callback, records: [], types: new Set(), mode: undefined,
+        requiresDroppedEntries: false, droppedStart: resourceDropped});
     }
     observe(options = {}) {
       const data = state(observerState, this);
+      _flushResourceTimings();
       options = dictionary(options);
       const buffered = options.buffered;
       const entryTypes = options.entryTypes;
@@ -12117,11 +12211,14 @@ globalThis.performance = globalThis.performance || {
     }
     static get supportedEntryTypes() { return supported; }
   };
-  for (const name of ['mark', 'measure', 'clearMarks', 'clearMeasures', 'getEntries', 'getEntriesByType', 'getEntriesByName']) {
+  for (const name of ['mark', 'measure', 'clearMarks', 'clearMeasures', 'clearResourceTimings',
+    'setResourceTimingBufferSize', 'addEventListener', 'removeEventListener', 'dispatchEvent',
+    'getEntries', 'getEntriesByType', 'getEntriesByName']) {
     Object.defineProperty(Performance.prototype, name, Object.getOwnPropertyDescriptor(perf, name));
     delete perf[name];
   }
-  for (const name of ['Performance', 'PerformanceEntry', 'PerformanceMark', 'PerformanceMeasure', 'PerformanceObserverEntryList', 'PerformanceObserver']) {
+  for (const name of ['Performance', 'PerformanceEntry', 'PerformanceMark', 'PerformanceMeasure',
+    'PerformanceResourceTiming', 'PerformanceObserverEntryList', 'PerformanceObserver']) {
     Object.defineProperty(globalThis, name, {enumerable: false});
     const proto = globalThis[name].prototype;
     Object.defineProperty(proto, Symbol.toStringTag, {value: name, configurable: true});

@@ -97,6 +97,18 @@ pub struct JsNetworkEvent {
     pub error_text: Option<String>,
 }
 
+struct ResourceTiming {
+    name: String,
+    initiator_type: String,
+    origin: String,
+    start_time: f64,
+    response_start: f64,
+    response_end: Option<f64>,
+    encoded_body_size: Option<usize>,
+    timing_allowed: bool,
+    status_allowed: bool,
+}
+
 #[cfg(feature = "render")]
 pub use obscura_render::ImageRequestProfile;
 
@@ -212,6 +224,8 @@ pub struct ObscuraState {
     // drained by the Page into its network_events so the CDP layer emits
     // Network.requestWillBeSent / responseReceived for them (issue #406).
     pub js_network_events: Vec<JsNetworkEvent>,
+    resource_timing_pending: HashMap<String, ResourceTiming>,
+    resource_timing_entries: Vec<serde_json::Value>,
     // Frame documents that have been fetched and are waiting for a realm.
     // Building one needs the whole runtime, which an op cannot reach, so
     // `op_frame_document_ready` queues here and the Page drains it between
@@ -450,6 +464,8 @@ impl ObscuraState {
             network_response_body_order: VecDeque::new(),
             fetched_urls: Vec::new(),
             js_network_events: Vec::new(),
+            resource_timing_pending: HashMap::new(),
+            resource_timing_entries: Vec::new(),
             pending_frames: Vec::new(),
             pending_frame_bytes: 0,
             frame_id_counter: 0,
@@ -686,11 +702,46 @@ fn record_js_network_completion(
 }
 
 fn push_js_network_event(gs: &mut ObscuraState, event: JsNetworkEvent) {
+    if let Some(timing) = gs.resource_timing_pending.remove(&event.request_id) {
+        let end = timing.response_end.unwrap_or_else(||
+            gs.navigation_timing.origin.elapsed().as_secs_f64() * 1_000.0);
+        let allowed = timing.timing_allowed && timing.response_start > 0.0 && event.error_text.is_none();
+        let encoded = if allowed { timing.encoded_body_size.unwrap_or(0) } else { 0 };
+        let decoded = if allowed { event.body_size } else { 0 };
+        gs.resource_timing_entries.push(serde_json::json!({
+            "name": timing.name, "entryType": "resource", "initiatorType": timing.initiator_type,
+            "startTime": timing.start_time, "duration": (end - timing.start_time).max(0.0),
+            "fetchStart": timing.start_time, "responseEnd": end,
+            "requestStart": if allowed { timing.start_time } else { 0.0 },
+            "responseStart": if allowed { timing.response_start } else { 0.0 },
+            "responseStatus": if timing.status_allowed && event.error_text.is_none() { event.status } else { 0 },
+            "encodedBodySize": encoded, "decodedBodySize": decoded,
+            // Resource Timing standardizes the HTTP header overhead as300.
+            // Unknown encoded transfer size (e.g. an opaque transport) stays0.
+            "transferSize": if allowed { timing.encoded_body_size.map(|size| size + 300).unwrap_or(0) } else { 0 },
+        }));
+    }
     gs.js_network_events.push(event);
     const MAX_JS_NETWORK_EVENTS: usize = 4096;
     if gs.js_network_events.len() > MAX_JS_NETWORK_EVENTS {
         let overflow = gs.js_network_events.len() - MAX_JS_NETWORK_EVENTS;
         gs.js_network_events.drain(0..overflow);
+    }
+}
+
+fn resource_response(
+    state: &RefCell<OpState>, request_id: &str, url: &str,
+    timing_allow_origin: &str, status_allowed: bool,
+) {
+    let shared = state.borrow().borrow::<SharedState>().clone();
+    let mut gs = shared.borrow_mut();
+    let now = gs.navigation_timing.origin.elapsed().as_secs_f64() * 1_000.0;
+    if let Some(timing) = gs.resource_timing_pending.get_mut(request_id) {
+        let same_origin = request_origin(url).as_deref() == Some(timing.origin.as_str());
+        timing.timing_allowed &= same_origin || timing_allow_origin.split(',')
+            .map(str::trim).any(|value| value == "*" || value == timing.origin);
+        timing.response_start = now;
+        timing.status_allowed = status_allowed;
     }
 }
 
@@ -711,17 +762,22 @@ fn fetch_max_body_bytes() -> usize {
 /// both when the server advertises an oversized `Content-Length` and when the
 /// streamed chunks exceed the cap (a lying or chunked server). Streaming keeps
 /// a multi-GB response from ever being fully allocated.
-async fn read_body_capped(
+async fn read_body_capped_with_size(
     response: reqwest::Response,
     max: usize,
-) -> Result<Vec<u8>, deno_error::JsErrorBox> {
+) -> Result<(Vec<u8>, usize), deno_error::JsErrorBox> {
     let url = response.url().clone();
-    obscura_net::client::read_reqwest_body_limited(response, &url, max).await
+    obscura_net::client::read_reqwest_body_limited_with_size(response, &url, max).await
         .map_err(|error| deno_error::JsErrorBox::generic(match error {
             obscura_net::ObscuraNetError::ResponseTooLarge { .. } =>
                 format!("response body exceeds the maximum of {max} bytes"),
             other => other.to_string(),
         }))
+}
+
+#[cfg(test)]
+async fn read_body_capped(response: reqwest::Response, max: usize) -> Result<Vec<u8>, deno_error::JsErrorBox> {
+    read_body_capped_with_size(response, max).await.map(|value| value.0)
 }
 
 struct PageInFlightGuard(Arc<std::sync::atomic::AtomicU32>);
@@ -1873,6 +1929,10 @@ fn op_dom(
 }
 
 fn op_dom_inner(shared: SharedState, cmd: String, arg1: String, arg2: String) -> String {
+    if cmd == "performance_resource_entries" {
+        return serde_json::to_string(&std::mem::take(&mut shared.borrow_mut().resource_timing_entries))
+            .unwrap_or_else(|_| "[]".into());
+    }
     if cmd == "performance_time_origin" {
         return shared.borrow().navigation_timing.time_origin.to_string();
     }
@@ -3649,6 +3709,20 @@ async fn fetch_url_inner(
         }),
         cancel: cancel.clone(),
     };
+    {
+        let shared = state.borrow().borrow::<SharedState>().clone();
+        let mut gs = shared.borrow_mut();
+        let start_time = gs.navigation_timing.origin.elapsed().as_secs_f64() * 1_000.0;
+        gs.resource_timing_pending.insert(request_id.clone(), ResourceTiming {
+            name: url.clone(),
+            initiator_type: match destination.as_str() {
+                "XHR" => "xmlhttprequest", "Script" => "script", "Stylesheet" => "link",
+                "Document" => "iframe", _ => "fetch",
+            }.into(),
+            origin: origin.clone(), start_time, response_start: 0.0, response_end: None,
+            encoded_body_size: None, timing_allowed: true, status_allowed: false,
+        });
+    }
     let credentials = FetchCredentials::parse(&credentials);
 
     // Slots the interception channel can override via Continue so a consumer
@@ -3687,6 +3761,13 @@ async fn fetch_url_inner(
                     // responses, including exact binary bodies and bounded retention.
                     let encoded = !bb.is_empty();
                     let body_size = if encoded { bb.trim_end_matches('=').len() * 3 / 4 } else { b.len() };
+                    let cross_origin = request_origin(&url).as_deref() != Some(origin.as_str());
+                    let exposed = !cross_origin || (mode == "cors" &&
+                        cors_response_allows(credentials, &origin,
+                            h.get("access-control-allow-origin").map(String::as_str).unwrap_or(""),
+                            h.get("access-control-allow-credentials").map(String::as_str).unwrap_or("")));
+                    resource_response(&state, &request_id, &url,
+                        h.get("timing-allow-origin").map(String::as_str).unwrap_or(""), exposed);
                     record_js_network_completion(&state, JsNetworkEvent {
                         request_id: request_id.clone(), intercepted: true,
                         error_text: None,
@@ -4021,6 +4102,9 @@ async fn fetch_url_inner(
             });
             req.send().await.map_err(|error| deno_error::JsErrorBox::generic(error.to_string()))?
         };
+        resource_response(&state, &request_id, &current_url,
+            resp.headers().get("timing-allow-origin").and_then(|value| value.to_str().ok()).unwrap_or(""),
+            false);
 
         if credentials_allowed {
             if let Some(ref jar) = cookie_jar {
@@ -4171,6 +4255,15 @@ async fn fetch_url_inner(
     }
 
     let opaque = !internal_load && mode == "no-cors" && crossed_origin;
+    {
+        let shared = state.borrow().borrow::<SharedState>().clone();
+        let mut gs = shared.borrow_mut();
+        if let Some(timing) = gs.resource_timing_pending.get_mut(&request_id) {
+            // Internal loaders need the real status to execute classic scripts,
+            // but their no-cors response remains opaque to the page timeline.
+            timing.status_allowed = mode != "no-cors" || !crossed_origin;
+        }
+    }
     let script_headers = if opaque {
         HashMap::new()
     } else {
@@ -4190,7 +4283,16 @@ async fn fetch_url_inner(
     let body = Box::pin(async move {
         let _page_in_flight = _page_in_flight;
         let mut network_guard = network_guard;
-        let resp_bytes = read_body_capped(response, fetch_max_body_bytes()).await?;
+        let (resp_bytes, encoded_size) = read_body_capped_with_size(response, fetch_max_body_bytes()).await?;
+        if let Some(state) = body_state.upgrade() {
+            let shared = state.borrow().borrow::<SharedState>().clone();
+            let mut gs = shared.borrow_mut();
+            let end = gs.navigation_timing.origin.elapsed().as_secs_f64() * 1_000.0;
+            if let Some(timing) = gs.resource_timing_pending.get_mut(&request_id) {
+                timing.encoded_body_size = Some(encoded_size);
+                timing.response_end = Some(end);
+            }
+        }
         if let Some(ref cbs) = callbacks {
             if cbs.has_response_callbacks().await {
                 let resp = fetch_response(

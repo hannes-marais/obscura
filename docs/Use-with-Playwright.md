@@ -113,8 +113,23 @@ entries, retrieve them through the timeline getters, and observe them through
 `PerformanceObserver`, including buffered delivery. Measurement options accept
 named marks or numeric timestamps; `detail` is structured-cloned.
 
-`PerformanceObserver.supportedEntryTypes` reports `mark` and `measure` only.
-Navigation, resource, paint, and long-task entries are not emitted. User Timing
+`PerformanceObserver.supportedEntryTypes` reports `mark`, `measure`, and `resource`.
+Completed script-initiated fetch/XHR and internal dynamic script, stylesheet,
+and frame fetches produce `PerformanceResourceTiming` entries. Default HTTP
+transport entries record actual header/body completion, response status and
+encoded/decoded body byte counts without another request or body decode.
+Cross-origin detail follows `Timing-Allow-Origin`; opaque responses do not
+expose status. Failed or cancelled requests are not reported as successful HTTP
+responses. Unavailable transport phases remain zero.
+
+The resource timeline defaults to250 entries. Use `setResourceTimingBufferSize()`,
+`clearResourceTimings()`, and the `resourcetimingbufferfull` event to manage it.
+Observers still receive completed resource records when that timeline is full.
+Parser-fetched static resources and render-loader resources are not yet included;
+alternate transports without phase/byte metadata expose only coarse completion.
+This is partial Resource Timing support, not a conformance claim.
+
+Navigation, paint, and long-task entries are not emitted. User Timing
 entries remain available until cleared or the realm is destroyed; applications
 that continuously record timings should call `clearMarks()` and `clearMeasures()`.
 Legacy `performance.timing` records main-document navigation start, fetch start,

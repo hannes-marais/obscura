@@ -818,6 +818,16 @@ pub async fn read_reqwest_body_limited(
     url: &Url,
     limit: usize,
 ) -> Result<Vec<u8>, ObscuraNetError> {
+    read_reqwest_body_limited_with_size(response, url, limit).await.map(|value| value.0)
+}
+
+/// Count the actual encoded chunks while performing the same bounded decode.
+/// Content-Length is representation metadata, not evidence of bytes received.
+pub async fn read_reqwest_body_limited_with_size(
+    response: reqwest::Response,
+    url: &Url,
+    limit: usize,
+) -> Result<(Vec<u8>, usize), ObscuraNetError> {
     use async_compression::tokio::bufread::{BrotliDecoder, GzipDecoder, ZlibDecoder};
     use futures_util::TryStreamExt;
     use tokio::io::{AsyncBufRead, AsyncBufReadExt, AsyncReadExt, BufReader};
@@ -833,14 +843,19 @@ pub async fn read_reqwest_body_limited(
     if !decode {
         reject_oversized_content_length(response.headers(), url, limit)?;
     }
-    let stream = response.bytes_stream().map_err(std::io::Error::other);
+    let encoded_size = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let counter = encoded_size.clone();
+    let stream = response.bytes_stream().map_ok(move |chunk| {
+        counter.fetch_add(chunk.len(), Ordering::Relaxed);
+        chunk
+    }).map_err(std::io::Error::other);
     let mut reader: std::pin::Pin<Box<dyn AsyncBufRead + Send>> =
         Box::pin(StreamReader::new(stream));
     let read_error = |error: std::io::Error|
         ObscuraNetError::Network(format!("Failed to read body: {}", error));
     // HEAD and no-body responses may carry representation metadata but no bytes.
     if reader.fill_buf().await.map_err(read_error)?.is_empty() {
-        return Ok(Vec::new());
+        return Ok((Vec::new(), 0));
     }
     if decode {
         for coding in codings.iter().rev() {
@@ -866,7 +881,7 @@ pub async fn read_reqwest_body_limited(
         }
         body.extend_from_slice(&chunk[..n]);
     }
-    Ok(body)
+    Ok((body, encoded_size.load(Ordering::Relaxed)))
 }
 
 pub struct ObscuraHttpClient {
