@@ -6833,6 +6833,7 @@ fn list_marker_text(
 
 fn selected_option_label(tree: &DomTree, select: obscura_dom::tree::NodeId) -> Option<String> {
     let mut first = None;
+    let live_value = tree.form_control_state(select).and_then(|state| state.value);
     for option_id in tree.descendants(select) {
         let Some(option) = tree.get_node(option_id) else {
             continue;
@@ -6849,6 +6850,16 @@ fn selected_option_label(tree: &DomTree, select: obscura_dom::tree::NodeId) -> O
             .unwrap_or_else(|| tree.text_content(option_id).trim().to_string());
         if first.is_none() {
             first = Some(label.clone());
+        }
+        if let Some(value) = live_value.as_deref() {
+            let option_value = option
+                .get_attribute("value")
+                .map(str::to_owned)
+                .unwrap_or_else(|| tree.text_content(option_id));
+            if option_value == value {
+                return Some(label);
+            }
+            continue;
         }
         if option.get_attribute("selected").is_some() {
             return Some(label);

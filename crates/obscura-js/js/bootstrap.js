@@ -4405,19 +4405,19 @@ class Element extends Node {
       return;
     }
     if (tag === 'select') {
-      // Set selected on matching option, clear on others. Puppeteer's
-      // page.select(selector, value) round-trips through this setter and
-      // dispatches its own input/change events in-page afterwards, like a
-      // real browser: a programmatic value assignment never fires change
-      // itself. Dispatching here fed pages that assign inside a change
-      // handler back into that handler in an infinite loop.
+      // A select's current selectedness is separate from each option's
+      // `selected` content attribute (its defaultSelected state). Changing
+      // those attributes here notifies MutationObservers and can make a
+      // document-driven app re-render the old choice before its change
+      // handler receives the new value.
       const wanted = String(v);
       const opts = this.querySelectorAll('option');
       for (let i = 0; i < opts.length; i++) {
         const attrV = opts[i].getAttribute('value');
         const optVal = attrV !== null ? attrV : opts[i].textContent;
-        opts[i].selected = optVal === wanted;
+        opts[i]._selected = optVal === wanted;
       }
+      _dom("set_form_value", this._nid, wanted);
       return;
     }
     const value = String(v);
@@ -4848,7 +4848,7 @@ class Element extends Node {
   get selectedIndex() {
     const opts = this.options;
     for (let i = 0; i < opts.length; i++) {
-      if (opts[i].selected || opts[i].hasAttribute('selected')) return i;
+      if (opts[i].selected) return i;
     }
     // Only a single select implicitly selects its first option; a multiple
     // select with nothing chosen idles at -1 like a real browser.
@@ -6281,10 +6281,12 @@ class Document extends Node {
       // have a separate XML stack, so return a minimal detached document
       // with an element of the requested local name as documentElement.
       createDocument(_ns, qualifiedName, _doctype) {
-        const name = (qualifiedName && String(qualifiedName)) || "root";
+        const name = qualifiedName ? String(qualifiedName) : "root";
         const safe = name.replace(/[^a-zA-Z0-9-]/g, "");
-        const html = qualifiedName ? `<${safe}></${safe}>` : "";
-        const doc = new DOMParser().parseFromString(html, "application/xml");
+        const doc = new DOMParser().parseFromString(`<${safe}></${safe}>`, "application/xml");
+        // A blank qualifiedName requests an empty XML Document, into which
+        // callers such as AppGen's encodeBlock insert their own root element.
+        if (!qualifiedName) doc.removeChild(doc.documentElement);
         if (_doctype) doc._docType = _doctype;
         return doc;
       },
@@ -7072,6 +7074,8 @@ function _elementClassFor(nid) {
       && _domParse("namespace_uri", nid) === "http://www.w3.org/1999/xhtml"
       && _domParse("local_name", nid) === "input") return globalThis.HTMLInputElement;
   if (tag === "TEXTAREA" && globalThis.HTMLTextAreaElement) return globalThis.HTMLTextAreaElement;
+  if (tag === "SELECT" && globalThis.HTMLSelectElement) return globalThis.HTMLSelectElement;
+  if (tag === "DETAILS" && globalThis.HTMLDetailsElement) return globalThis.HTMLDetailsElement;
   if (tag === "META" && globalThis.HTMLMetaElement
       && _domParse("namespace_uri", nid) === "http://www.w3.org/1999/xhtml"
       && _domParse("local_name", nid) === "meta") return globalThis.HTMLMetaElement;
@@ -7102,6 +7106,8 @@ function _elementClassForKnownName(namespace, qualifiedName) {
     if (tag === "FORM" && globalThis.HTMLFormElement) return globalThis.HTMLFormElement;
     if (localName === "input" && globalThis.HTMLInputElement) return globalThis.HTMLInputElement;
     if (tag === "TEXTAREA" && globalThis.HTMLTextAreaElement) return globalThis.HTMLTextAreaElement;
+    if (tag === "SELECT" && globalThis.HTMLSelectElement) return globalThis.HTMLSelectElement;
+    if (tag === "DETAILS" && globalThis.HTMLDetailsElement) return globalThis.HTMLDetailsElement;
     if (localName === "meta" && globalThis.HTMLMetaElement) return globalThis.HTMLMetaElement;
     if (tag === "SLOT" && globalThis.HTMLSlotElement) return globalThis.HTMLSlotElement;
     if (tag === "IMG") return HTMLImageElement;
@@ -7838,6 +7844,9 @@ function _serializeBody(initBody, headers, synthesizeContentType = true) {
   return new TextEncoder().encode(typeof initBody === 'string' ? initBody : String(initBody));
 }
 
+// Object URLs are runtime-local byte references, not HTTP requests. Keep the
+// snapshots private; the separate Worker registry retains decoded script text.
+const _objectURLBlobs = new Map();
 async function _fetch(input, init = {}, resourceType = "Fetch") {
   init = init || {};
   const request = input instanceof Request ? input : null;
@@ -7880,6 +7889,19 @@ async function _fetch(input, init = {}, resourceType = "Fetch") {
   const signal = inputSignal == null ? null : _createDependentAbortSignal([inputSignal]);
   const signalState = signal && _abortSignalState(signal);
   if (signalState && signalState.aborted) throw signalState.reason;
+  if (url.startsWith('blob:')) {
+    const address = url.split('#')[0];
+    const blob = _objectURLBlobs.get(address);
+    if (!blob || method !== 'GET') throw new TypeError('Failed to fetch object URL');
+    const bytes = await blob.arrayBuffer();
+    if (signalState && signalState.aborted) throw signalState.reason;
+    const response = _createInternalResponse(bytes, {
+      status: 200, statusText: 'OK', type: 'basic', url: address,
+      headers: { 'content-type': blob.type, 'content-length': String(blob.size) },
+    });
+    _attachResponseAbort(response, signal);
+    return response;
+  }
   const cancelRid = signal ? __obscuraCore.ops.op_fetch_cancel_handle() : undefined;
   const cancellation = { rid: cancelRid };
   const removeAbort = signal ? _addAbortAlgorithm(signal, cancellation, _cancelFetchHandle) : null;
@@ -11430,20 +11452,9 @@ const _checkXmlWellFormed = (html) => {
   return { wellFormed: true };
 };
 
-// Real-enough DOMParser. The previous one-liner returned `globalThis.document`,
-// so anything that did `new DOMParser().parseFromString(s, 'text/html')` and
-// then read `.body.innerHTML` mutated the LIVE page (jQuery 3.x's selector
-// feature-detect writes `<form></form>` and wiped real bodies). We parse the
-// input into a detached `<html>` element and wrap it so the common Document
-// API surface (body / head / documentElement / querySelector* / getElementById /
-// getElementsByTagName / getElementsByClassName / title / cloneNode) works.
-// Conservative XML well-formedness check. obscura has no XML parser, so this
-// only decides whether to surface a <parsererror> (it does not build an XML
-// tree). It flags clear structural errors — mismatched or unclosed tags,
-// multiple/no root elements, unterminated comment/CDATA/PI — and defaults to
-// "well-formed" whenever the scan is ambiguous, so valid XML is never falsely
-// flagged. Quoted attribute regions, comments, CDATA, PIs and the doctype are
-// skipped; a literal '<' in text (invalid in XML) reads as a bad tag.
+// DOMParser uses a detached HTML fragment for text/html and a case-preserving
+// XML tree for XML MIME types. The XML scanner rejects malformed structure;
+// the separate descriptive check supplies parsererror detail.
 function _xmlWellFormed(src) {
   const s = String(src);
   const stack = [];
@@ -11487,20 +11498,118 @@ function _xmlWellFormed(src) {
   return stack.length === 0 && rootsClosed === 1;
 }
 
-// The parsererror detail quotes tag names taken from the input, and it is
-// written through innerHTML, so `<` and `&` have to stop being markup.
-const _escapeXmlErrorText = (text) =>
-  String(text).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+// Build XML nodes without the HTML fragment parser. HTML parsing inserts an
+// <html> wrapper and folds names, which makes valid application/xml unusable
+// to callers that inspect documentElement or case-sensitive child names.
+function _parseXmlTree(source) {
+  const stack = [];
+  const namespaces = [{ xml: "http://www.w3.org/XML/1998/namespace" }];
+  let root = null;
+  let i = 0;
+  const decode = value => {
+    if (/&(?!(?:#(?:x[0-9a-fA-F]+|[0-9]+)|amp|lt|gt|quot|apos);)/.test(value)) {
+      throw new Error('Invalid XML entity');
+    }
+    return value.replace(/&(#(?:x[0-9a-fA-F]+|[0-9]+)|amp|lt|gt|quot|apos);/g, (_, entity) => {
+      if (entity[0] === '#') {
+        const cp = entity[1] === 'x'
+          ? parseInt(entity.slice(2), 16) : parseInt(entity.slice(1), 10);
+        return String.fromCodePoint(cp);
+      }
+      return { amp: '&', lt: '<', gt: '>', quot: '"', apos: "'" }[entity];
+    });
+  };
+  while (i < source.length) {
+    const lt = source.indexOf('<', i);
+    const endText = lt < 0 ? source.length : lt;
+    if (endText > i) {
+      const raw = source.slice(i, endText);
+      if (stack.length) stack[stack.length - 1].appendChild(document.createTextNode(decode(raw)));
+      else if (raw.trim()) return null;
+    }
+    if (lt < 0) break;
+    if (source.startsWith('<!--', lt)) {
+      const end = source.indexOf('-->', lt + 4);
+      if (end < 0) return null;
+      if (stack.length) stack[stack.length - 1].appendChild(document.createComment(source.slice(lt + 4, end)));
+      i = end + 3;
+      continue;
+    }
+    if (source.startsWith('<![CDATA[', lt)) {
+      const end = source.indexOf(']]>', lt + 9);
+      if (end < 0 || !stack.length) return null;
+      stack[stack.length - 1].appendChild(document.createTextNode(source.slice(lt + 9, end)));
+      i = end + 3;
+      continue;
+    }
+    if (source.startsWith('<?', lt)) {
+      const end = source.indexOf('?>', lt + 2);
+      if (end < 0) return null;
+      i = end + 2;
+      continue;
+    }
+    if (source.startsWith('<!', lt)) {
+      const end = source.indexOf('>', lt + 2);
+      if (end < 0) return null;
+      i = end + 1;
+      continue;
+    }
+    let end = lt + 1, quote = null;
+    while (end < source.length) {
+      const c = source[end];
+      if (quote) { if (c === quote) quote = null; }
+      else if (c === '"' || c === "'") quote = c;
+      else if (c === '>') break;
+      end++;
+    }
+    if (end >= source.length) return null;
+    const token = source.slice(lt + 1, end).trim();
+    i = end + 1;
+    if (token[0] === '/') {
+      if (!stack.length || stack[stack.length - 1].tagName !== token.slice(1).trim()) return null;
+      stack.pop();
+      namespaces.pop();
+      continue;
+    }
+    const selfClosing = token.endsWith('/');
+    const start = selfClosing ? token.slice(0, -1).trimEnd() : token;
+    const name = /^[^\s=/>]+/.exec(start)?.[0];
+    if (!name || (root && !stack.length)) return null;
+    const attrs = [];
+    let rest = start.slice(name.length);
+    while (rest.trim()) {
+      const match = /^\s+([^\s=/>]+)\s*=\s*(["'])([\s\S]*?)\2/.exec(rest);
+      if (!match) return null;
+      attrs.push([match[1], decode(match[3])]);
+      rest = rest.slice(match[0].length);
+    }
+    const ns = { ...namespaces[namespaces.length - 1] };
+    for (const [key, value] of attrs) {
+      if (key === 'xmlns') ns[''] = value;
+      else if (key.startsWith('xmlns:')) ns[key.slice(6)] = value;
+    }
+    const prefix = name.includes(':') ? name.slice(0, name.indexOf(':')) : '';
+    if (prefix && !ns[prefix]) return null;
+    const el = document.createElementNS(ns[prefix] || null, name);
+    for (const [key, value] of attrs) el.setAttribute(key, value);
+    if (stack.length) stack[stack.length - 1].appendChild(el);
+    else root = el;
+    if (!selfClosing) {
+      stack.push(el);
+      namespaces.push(ns);
+    }
+  }
+  return stack.length ? null : root;
+}
 
 globalThis.DOMParser = class DOMParser {
   parseFromString(source, mimeType) {
     const html = String(source ?? "");
     const isXml = typeof mimeType === "string" && /xml/i.test(mimeType);
-    const root = document.createElement("html");
+    let root = isXml ? null : document.createElement("html");
 
-    // For XML mime types, surface a <parsererror> on clearly-malformed input so
-    // error-detection code (doc.querySelector('parsererror')) works, matching
-    // Chrome. obscura has no XML parser, so the tree stays HTML-parsed.
+    // For XML MIME types, surface a <parsererror> on malformed input and
+    // otherwise expose a case-preserving XML documentElement.
     //
     // Two checks, one decision. `_xmlWellFormed` is the stricter of the pair --
     // it also rejects input with no root element at all, and an unterminated
@@ -11512,16 +11621,18 @@ globalThis.DOMParser = class DOMParser {
     // first. Since the stricter check flags everything the descriptive one
     // flags, the description never reached a caller.
     const xmlError = isXml ? _checkXmlWellFormed(html) : null;
-    const isParserError = isXml && (!_xmlWellFormed(html) || !xmlError.wellFormed);
+    if (isXml && _xmlWellFormed(html) && xmlError.wellFormed) {
+      try { root = _parseXmlTree(html); } catch (e) { root = null; }
+    }
+    const isParserError = isXml && !root;
     if (isParserError) {
       const detail = (xmlError && xmlError.error) || 'error while parsing XML';
-      try {
-        root.innerHTML =
-          '<parsererror xmlns="http://www.w3.org/1999/xhtml">This page contains the following errors:<div>' +
-          _escapeXmlErrorText(detail) +
-          '</div></parsererror>';
-      } catch (e) { /* ignore */ }
-    } else {
+      root = document.createElementNS("http://www.w3.org/1999/xhtml", "parsererror");
+      root.appendChild(document.createTextNode('This page contains the following errors:'));
+      const div = document.createElementNS("http://www.w3.org/1999/xhtml", "div");
+      div.appendChild(document.createTextNode(detail));
+      root.appendChild(div);
+    } else if (!isXml) {
       // innerHTML parses children via html5ever fragment-parsing rules. Most
       // HTML inputs start with `<!DOCTYPE>` / `<html>` / `<head>` etc.; the
       // fragment parser strips the outer `<html>` and emits its head+body
@@ -11544,15 +11655,12 @@ globalThis.DOMParser = class DOMParser {
     const findByTagName = (name) => walk(root, n => n.tagName === name);
 
     const docNode = {
-      _root: root,
+      get _root() { return root; },
       nodeName: "#document",
       nodeType: 9,
       queryCommandSupported: Document.prototype.queryCommandSupported,
       contentType: isXml ? (mimeType || "application/xml") : "text/html",
       get documentElement() {
-        // For XML parsererror docs, return the <parsererror> child, not the
-        // <html> wrapper — matches Chrome's behavior.
-        if (isParserError) return root.firstElementChild;
         return root;
       },
       get body() { return findByTagName("BODY"); },
@@ -11576,8 +11684,8 @@ globalThis.DOMParser = class DOMParser {
       },
       get firstChild() { return root; },
       get lastChild() { return root; },
-      get children() { return [root]; },
-      get childNodes() { return [root]; },
+      get children() { return root ? [root] : []; },
+      get childNodes() { return root ? [root] : []; },
       // Document metadata the WHATWG interface exposes; DOMParser documents have
       // URL about:blank, are already fully parsed, and carry no stylesheets.
       get URL() { return "about:blank"; },
@@ -11597,25 +11705,20 @@ globalThis.DOMParser = class DOMParser {
       createTreeWalker(r, ws, f) { return document.createTreeWalker(r || root, ws, f); },
       createNodeIterator(r, ws, f) { return document.createNodeIterator(r || root, ws, f); },
       querySelector(s) {
+        if (!root) return null;
         // For XML parsererror docs, check the root element as well —
         // the <parsererror> is the documentElement, not a descendant.
-        return root.querySelector(s) || (isParserError && root.matches(s) ? root : null);
+        return root.querySelector(s) || (isXml && root.matches(s) ? root : null);
       },
-      querySelectorAll(s) { return root.querySelectorAll(s); },
+      querySelectorAll(s) { return root ? root.querySelectorAll(s) : []; },
       getElementById(id) {
         return walk(root, n => n.getAttribute && n.getAttribute("id") === id);
       },
-      getElementsByTagName(t) {
-        return root.querySelectorAll(t);
-      },
-      getElementsByClassName(c) {
-        return _getElementsByClassName(root, c);
-      },
-      getElementsByName(n) {
-        return root.querySelectorAll(`[name="${n}"]`);
-      },
+      getElementsByTagName(t) { return root ? root.querySelectorAll(t) : []; },
+      getElementsByClassName(c) { return root ? _getElementsByClassName(root, c) : []; },
+      getElementsByName(n) { return root ? root.querySelectorAll(`[name="${n}"]`) : []; },
       createElement: (t) => document.createElement(t),
-      createElementNS: (ns, t) => document.createElement(t),
+      createElementNS: (ns, t) => document.createElementNS(ns, t),
       createTextNode: (t) => document.createTextNode(t),
       createComment: (t) => document.createComment(t),
       createDocumentFragment: () => document.createDocumentFragment(),
@@ -11635,18 +11738,34 @@ globalThis.DOMParser = class DOMParser {
       },
       adoptNode: (n) => n,
       importNode: (n) => n,
-      // Document-level node insertion. Detached docs from createHTMLDocument /
-      // createDocument back onto the same tree, so appending lands under the
-      // documentElement; enough for dom/common.js to build its Range fixtures.
-      appendChild: function (n) { try { root.appendChild(n); } catch (e) {} return n; },
-      removeChild: function (n) { try { root.removeChild(n); } catch (e) {} return n; },
-      insertBefore: function (n, ref) { try { root.insertBefore(n, ref); } catch (e) {} return n; },
+      // An XML Document owns one top-level element. In particular,
+      // createDocument('', '', null) begins empty and accepts its first root.
+      appendChild: function (n) {
+        if (isXml) {
+          if (root) throw new DOMException('Document already has a root element', 'HierarchyRequestError');
+          root = n;
+        } else if (root) root.appendChild(n);
+        return n;
+      },
+      removeChild: function (n) {
+        if (n === root) root = null;
+        else if (root) root.removeChild(n);
+        return n;
+      },
+      insertBefore: function (n, ref) {
+        if (isXml && (!root || ref === root)) {
+          if (root) throw new DOMException('Document already has a root element', 'HierarchyRequestError');
+          root = n;
+        } else if (root) root.insertBefore(n, ref);
+        return n;
+      },
       _docType: null,
       get doctype() { return this._docType; },
       cloneNode: function (deep) {
-        return new DOMParser().parseFromString(root.outerHTML, mimeType);
+        return root ? new DOMParser().parseFromString(root.outerHTML, mimeType)
+          : document.implementation.createDocument('', '', null);
       },
-      contains(n) { return root.contains ? root.contains(n) : false; },
+      contains(n) { return root && root.contains ? root.contains(n) : false; },
       addEventListener() {}, removeEventListener() {}, dispatchEvent() { return true; },
     };
     _documentInstances.add(docNode);
@@ -13076,7 +13195,10 @@ globalThis.HTMLFormElement = class HTMLFormElement extends Element {
     }
   }
 };
-globalThis.HTMLSelectElement = Element;
+// Native element interfaces must remain distinct: clients often test details
+// before reading a select's value. An Element alias makes every select look
+// like a details element and submits its `open` state instead of its choice.
+globalThis.HTMLSelectElement = class HTMLSelectElement extends Element {};
 globalThis.HTMLTextAreaElement = class HTMLTextAreaElement extends Element {
   get readOnly() { return this.hasAttribute('readonly'); }
   set readOnly(v) { if (v) this.setAttribute('readonly', ''); else this.removeAttribute('readonly'); }
@@ -13175,7 +13297,7 @@ globalThis.HTMLDataListElement = Element;
 globalThis.HTMLFieldSetElement = Element;
 globalThis.HTMLLegendElement = Element;
 globalThis.HTMLProgressElement = Element;
-globalThis.HTMLDetailsElement = Element;
+globalThis.HTMLDetailsElement = class HTMLDetailsElement extends Element {};
 globalThis.HTMLDialogElement = Element;
 // SVGAnimatedString backs the className and href reflections on SVG elements.
 // baseVal and animVal both read the live attribute (no SMIL animation), and
@@ -15555,6 +15677,9 @@ URL.createObjectURL = function(blob) {
           return (c === 'x' ? r : (r & 0x3) | 0x8).toString(16);
         });
     const id = 'blob:' + origin + '/' + uuid;
+    _objectURLBlobs.set(id, typeof blob.slice === 'function'
+      ? blob.slice(0, blob.size, blob.type)
+      : new Blob([blob._bytes], { type: blob.type }));
     // Store synchronously so a Worker built from the blob URL in the same
     // tick sees its source. Blob-URL Worker construction is synchronous in
     // real browsers; the previous async blob.text().then() store raced the
@@ -15575,6 +15700,7 @@ URL.createObjectURL = function(blob) {
   }
 };
 URL.revokeObjectURL = function(url) {
+  _objectURLBlobs.delete(String(url));
   delete globalThis.__blobStore[url];
 };
 

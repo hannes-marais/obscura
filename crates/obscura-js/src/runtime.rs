@@ -4870,6 +4870,82 @@ mod tests {
         );
     }
 
+    #[cfg(feature = "render")]
+    #[test]
+    fn select_value_changes_live_choice_without_mutating_default_selected() {
+        let mut rt = setup_runtime(
+            "<!doctype html><html><body><select id=page><option value=25 selected>25 decks</option><option value=50>50 decks</option></select></body></html>",
+        );
+        rt.set_viewport(240.0, 80.0);
+        let before = rt
+            .screenshot_prepared((240.0, 80.0), Some("http://example.com/test"))
+            .unwrap();
+        let result = rt
+            .evaluate(
+                r#"(() => {
+                    const select = document.getElementById('page');
+                    const events = [];
+                    select.addEventListener('change', event => events.push(event.target.value));
+                    select.value = '50';
+                    select.dispatchEvent(new Event('change', { bubbles: true }));
+                    return JSON.stringify({
+                        value: select.value,
+                        index: select.selectedIndex,
+                        defaults: [...select.options].map(option => option.hasAttribute('selected')),
+                        events,
+                    });
+                })()"#,
+            )
+            .unwrap();
+        let value: serde_json::Value = serde_json::from_str(result.as_str().unwrap()).unwrap();
+        assert_eq!(value["value"], "50");
+        assert_eq!(value["index"], 1);
+        assert_eq!(value["defaults"], serde_json::json!([true, false]));
+        assert_eq!(value["events"], serde_json::json!(["50"]));
+        let after = rt
+            .screenshot_prepared((240.0, 80.0), Some("http://example.com/test"))
+            .unwrap();
+        assert_ne!(before, after, "the new live choice must repaint");
+    }
+
+    #[test]
+    fn select_and_details_have_distinct_dom_interface_types() {
+        let mut rt = setup_runtime(
+            "<html><body><select id=page><option value=25>25</option><option value=50>50</option></select><details id=help></details></body></html>",
+        );
+        let result = rt.evaluate(r#"(() => {
+            const select = document.getElementById('page');
+            const details = document.getElementById('help');
+            const createdSelect = document.createElement('select');
+            const createdDetails = document.createElement('details');
+            select.value = '50';
+            // This is the AppUI value-routing guard used by generated Web apps.
+            const routedValue = select instanceof HTMLDetailsElement
+                ? String(select.open) : ('value' in select ? String(select.value) : undefined);
+            return JSON.stringify({
+                selectIsSelect: select instanceof HTMLSelectElement,
+                selectIsDetails: select instanceof HTMLDetailsElement,
+                detailsIsDetails: details instanceof HTMLDetailsElement,
+                detailsIsSelect: details instanceof HTMLSelectElement,
+                createdSelectIsSelect: createdSelect instanceof HTMLSelectElement,
+                createdSelectIsDetails: createdSelect instanceof HTMLDetailsElement,
+                createdDetailsIsDetails: createdDetails instanceof HTMLDetailsElement,
+                createdDetailsIsSelect: createdDetails instanceof HTMLSelectElement,
+                routedValue,
+            });
+        })()"#).unwrap();
+        let value: serde_json::Value = serde_json::from_str(result.as_str().unwrap()).unwrap();
+        assert_eq!(value["selectIsSelect"], true);
+        assert_eq!(value["selectIsDetails"], false);
+        assert_eq!(value["detailsIsDetails"], true);
+        assert_eq!(value["detailsIsSelect"], false);
+        assert_eq!(value["createdSelectIsSelect"], true);
+        assert_eq!(value["createdSelectIsDetails"], false);
+        assert_eq!(value["createdDetailsIsDetails"], true);
+        assert_eq!(value["createdDetailsIsSelect"], false);
+        assert_eq!(value["routedValue"], "50");
+    }
+
     #[test]
     fn cloned_controls_keep_current_value_and_checked_state() {
         let mut rt = setup_runtime(
@@ -4936,6 +5012,64 @@ mod tests {
             serde_json::json!(true),
             "createObjectURL must throw TypeError for non-Blob input"
         );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn fetch_object_url_preserves_binary_bytes_and_response_contract() {
+        let mut rt = setup_runtime("<html><body></body></html>");
+        let result = rt.call_function_on_for_cdp(
+            r#"async () => {
+                const input = new Uint8Array([0, 255, 128, 65]);
+                const blob = new Blob([input], {type: 'application/octet-stream'});
+                const url = URL.createObjectURL(blob);
+                input.fill(7);
+                blob._bytes.fill(9);
+                const response = await fetch(url + '#fragment');
+                const copy = response.clone();
+                const first = Array.from(new Uint8Array(await response.arrayBuffer()));
+                const second = Array.from(new Uint8Array(await copy.arrayBuffer()));
+                const repeated = Array.from(new Uint8Array(await (await fetch(url)).arrayBuffer()));
+                const result = {first, second, repeated, status: response.status,
+                    type: response.headers.get('content-type'),
+                    length: response.headers.get('content-length'), used: response.bodyUsed,
+                    url: response.url === url};
+                URL.revokeObjectURL(url);
+                return result;
+            }"#, None, &[], true, true,
+        ).await.unwrap();
+        assert_eq!(result.value, Some(serde_json::json!({
+            "first": [0, 255, 128, 65], "second": [0, 255, 128, 65],
+            "repeated": [0, 255, 128, 65], "status": 200,
+            "type": "application/octet-stream", "length": "4", "used": true, "url": true,
+        })));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn fetch_object_url_rejects_revoked_unknown_methods_and_aborted_reads() {
+        let mut rt = setup_runtime("<html><body></body></html>");
+        let result = rt.call_function_on_for_cdp(
+            r#"async () => {
+                const url = URL.createObjectURL(new File(['text'], 'source.txt', {type:'text/plain'}));
+                const rejects = async (value, init) => {
+                    try { await fetch(value, init); return false; }
+                    catch (error) { return error instanceof TypeError; }
+                };
+                const post = await rejects(url, {method:'POST'});
+                const controller = new AbortController();
+                controller.abort('stopped');
+                let abortReason;
+                try { await fetch(url, {signal:controller.signal}); }
+                catch (error) { abortReason = error; }
+                const admitted = await fetch(url);
+                URL.revokeObjectURL(url);
+                return {post, abortReason, admittedText:await admitted.text(),
+                    revoked:await rejects(url), unknown:await rejects(url + '-unknown')};
+            }"#, None, &[], true, true,
+        ).await.unwrap();
+        assert_eq!(result.value, Some(serde_json::json!({
+            "post": true, "abortReason": "stopped", "admittedText": "text",
+            "revoked": true, "unknown": true,
+        })));
     }
 
     // SEC-301 / SEC-302 / #792 — the profile setters must embed values safely.
@@ -7113,6 +7247,33 @@ mod tests {
             .evaluate("(function(){var d=new DOMParser().parseFromString('<root><child>x</child></root>','application/xml'); return d.querySelector('parsererror') ? 'ERR' : 'OK';})()")
             .unwrap();
         assert_eq!(ok, serde_json::json!("OK"));
+    }
+
+    #[test]
+    fn dom_parser_preserves_xml_root_case_and_children() {
+        let mut rt = setup_runtime("<html><body></body></html>");
+        let value = rt
+            .evaluate("(function(){var xml='<blocks><decker-editor-fields><template name=\"Sample\"><pageSizeOptions>25</pageSizeOptions></template></decker-editor-fields></blocks>';var d=new DOMParser().parseFromString(xml,'application/xml');var r=d.documentElement;return [r.tagName,r.children[0].tagName,r.children[0].children[0].getAttribute('name'),r.children[0].children[0].children[0].tagName,r.children[0].children[0].children[0].textContent,d.querySelector('parsererror')===null].join('|');})()")
+            .unwrap();
+        assert_eq!(value, serde_json::json!("blocks|decker-editor-fields|Sample|pageSizeOptions|25|true"));
+    }
+
+    #[test]
+    fn dom_parser_handles_large_xml_catalog_and_empty_bindings() {
+        let mut rt = setup_runtime("<html><body></body></html>");
+        let value = rt
+            .evaluate("(function(){var rows=Array.from({length:114},(_,i)=>'<template name=\"t'+i+'\"><label>A &amp; B'+ 'x'.repeat(450) +'</label></template>').join('');var d=new DOMParser().parseFromString('<blocks><decker-editor-fields>'+rows+'</decker-editor-fields></blocks>','application/xml');var empty=new DOMParser().parseFromString('<blocks><dossier-files></dossier-files></blocks>','application/xml');return [d.documentElement.tagName,d.documentElement.children[0].children.length,d.documentElement.children[0].children[0].children[0].textContent.slice(0,5),empty.documentElement.tagName,empty.documentElement.children[0].tagName].join('|');})()")
+            .unwrap();
+        assert_eq!(value, serde_json::json!("blocks|114|A & B|blocks|dossier-files"));
+    }
+
+    #[test]
+    fn empty_xml_document_encodes_a_single_block_root() {
+        let mut rt = setup_runtime("<html><body></body></html>");
+        let value = rt
+            .evaluate("(function(){var d=document.implementation.createDocument('', '', null);var empty=d.documentElement===null;var wrapper=d.createElementNS(null,'blocks');d.appendChild(wrapper);var footer=d.createElementNS(null,'cps-footer');wrapper.appendChild(footer);var welcome=d.createElementNS(null,'isWelcome');welcome.textContent='true';footer.appendChild(welcome);var canNew=d.createElementNS(null,'canNew');canNew.textContent='true';footer.appendChild(canNew);var xml=new XMLSerializer().serializeToString(d);var parsed=new DOMParser().parseFromString(xml,'application/xml');return [empty,xml,parsed.documentElement.tagName,parsed.querySelector('parsererror')===null].join('|');})()")
+            .unwrap();
+        assert_eq!(value, serde_json::json!("true|<blocks><cps-footer><isWelcome>true</isWelcome><canNew>true</canNew></cps-footer></blocks>|blocks|true"));
     }
 
     #[test]
