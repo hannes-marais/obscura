@@ -502,7 +502,11 @@ pub async fn handle(
                             let js = "(function() {\
                                 var target = document.activeElement;\
                                 if (!target) return;\
-                                target.dispatchEvent(globalThis.__obscura_markTrusted(new KeyboardEvent('keypress', {bubbles:true,key:'Enter',code:'Enter',keyCode:$VK,which:$VK,charCode:$VK,$MODIFIERS})));\
+                                if (!target.dispatchEvent(globalThis.__obscura_markTrusted(new KeyboardEvent('keypress', {bubbles:true,cancelable:true,key:'Enter',code:'Enter',keyCode:$VK,which:$VK,charCode:$VK,$MODIFIERS})))) return;\
+                                if (target.localName === 'button' || (target.localName === 'input' && /^(button|submit|reset|image)$/.test(target.type))) {\
+                                    globalThis.__obscura_activateElement(target);\
+                                    return;\
+                                }\
                                 if (target.localName === 'textarea') {\
                                     if (target.hasAttribute('readonly')) return;\
                                     var value = target.value || '';\

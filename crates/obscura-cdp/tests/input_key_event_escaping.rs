@@ -324,3 +324,67 @@ async fn insert_text_types_into_the_focused_field() {
         "insertText must type the full text with quotes, backslashes, and newlines intact"
     );
 }
+
+#[tokio::test(flavor = "current_thread")]
+async fn enter_activates_native_button_once_with_trust_and_preserves_submitter() {
+    let mut ctx = CdpContext::new();
+    let page = ctx.create_page();
+    let sid = "keyboard-activation";
+    ctx.sessions.insert(sid.into(), page);
+    cdp(&mut ctx, 1, "Runtime.evaluate", json!({"expression": r#"
+        document.body.innerHTML='<form id="form"><button id="plain" type="button">plain</button><button id="submit" type="submit">submit</button><button id="disabled" type="button" disabled>disabled</button></form>';
+        globalThis.activations=[]; globalThis.submissions=[];
+        for (const id of ['plain','submit','disabled']) document.getElementById(id).addEventListener('click', e => activations.push([id,e.isTrusted]));
+        document.getElementById('form').addEventListener('submit',e=>{e.preventDefault();submissions.push(e.submitter?.id)});
+    "#, "returnByValue":true}), sid).await;
+    for (index, id) in ["plain", "submit", "disabled"].into_iter().enumerate() {
+        cdp(&mut ctx, 2, "Runtime.evaluate", json!({"expression":format!("document.activeElement?.blur(); document.getElementById('{id}').focus()"),"returnByValue":true}), sid).await;
+        for kind in ["keyDown", "keyUp"] {
+            cdp(&mut ctx, 3+index as u64, "Input.dispatchKeyEvent", json!({"type":kind,"key":"Enter","code":"Enter","windowsVirtualKeyCode":13}), sid).await;
+        }
+    }
+    let result = cdp(&mut ctx, 8, "Runtime.evaluate", json!({"expression":"JSON.stringify({activations,submissions})","returnByValue":true}), sid).await;
+    let observed: Value = serde_json::from_str(result["result"]["value"].as_str().unwrap()).unwrap();
+    assert_eq!(observed["activations"], json!([["plain",true],["submit",true]]));
+    assert_eq!(observed["submissions"], json!(["submit"]));
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn enter_button_activation_respects_keydown_keypress_and_click_cancellation() {
+    let mut ctx = CdpContext::new();
+    let page = ctx.create_page();
+    let sid = "keyboard-cancel";
+    ctx.sessions.insert(sid.into(), page);
+    cdp(&mut ctx, 1, "Runtime.evaluate", json!({"expression":r#"
+        document.body.innerHTML='<form id="form"><button id="button" type="submit">go</button></form>';
+        globalThis.clicks=0;globalThis.submits=0;
+        document.getElementById('button').addEventListener('click',()=>clicks++);
+        document.getElementById('form').addEventListener('submit',e=>{e.preventDefault();submits++});
+        document.getElementById('button').focus();
+    "#,"returnByValue":true}), sid).await;
+    for kind in ["keydown","keypress","click"] {
+        cdp(&mut ctx, 2, "Runtime.evaluate", json!({"expression":format!("document.getElementById('button').addEventListener('{kind}',e=>e.preventDefault(),{{once:true}})"),"returnByValue":true}), sid).await;
+        cdp(&mut ctx, 3, "Input.dispatchKeyEvent", json!({"type":"keyDown","key":"Enter","code":"Enter","windowsVirtualKeyCode":13}), sid).await;
+        cdp(&mut ctx, 4, "Input.dispatchKeyEvent", json!({"type":"keyUp","key":"Enter","code":"Enter","windowsVirtualKeyCode":13}), sid).await;
+    }
+    let result = cdp(&mut ctx, 5, "Runtime.evaluate", json!({"expression":"JSON.stringify({clicks,submits})","returnByValue":true}), sid).await;
+    let observed: Value = serde_json::from_str(result["result"]["value"].as_str().unwrap()).unwrap();
+    assert_eq!(observed,json!({"clicks":1,"submits":0}));
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn submit_event_constructor_retains_readonly_submitter_and_defaults_to_null() {
+    let mut ctx = CdpContext::new();
+    let page = ctx.create_page();
+    let sid = "submit-event-contract";
+    ctx.sessions.insert(sid.into(), page);
+    let result = cdp(&mut ctx, 1, "Runtime.evaluate", json!({"expression":r#"
+        (()=>{
+            const button=document.createElement('button');
+            const event=new SubmitEvent('submit',{submitter:button,bubbles:true,cancelable:true});
+            let readonly=false;try{(function(){'use strict';event.submitter=null})()}catch(e){readonly=e instanceof TypeError}
+            return JSON.stringify([new SubmitEvent('submit').submitter===null,event.submitter===button,event.bubbles,event.cancelable,event.isTrusted,readonly]);
+        })()
+    "#,"returnByValue":true}), sid).await;
+    assert_eq!(result["result"]["value"],"[true,true,true,true,false,true]");
+}

@@ -30,7 +30,7 @@ const __obscuraCore = globalThis.Deno.core;
     '__obscura_frameId', '__obscura_parentFrameId', '__obscura_frameWindows',
     '__obscura_frameObjects', '__obscura_frameElements', '__obscura_deliverMessage',
     '__obscura_liveFrameIds', '__obscura_forgetFrame',
-    '__obscura_registerLinkedStylesheet', '__obscura_activateLabel',
+    '__obscura_registerLinkedStylesheet', '__obscura_activateLabel', '__obscura_activateElement',
     '__obscura_isDisabled', '__obscura_labeledControl', '__obscura_interactiveHost',
     '__obscura_inputChecked', '__obscura_setInputChecked',
     '__obscura_inputIndeterminate', '__obscura_setInputIndeterminate',
@@ -3144,6 +3144,9 @@ globalThis.__obscura_activateLabel = function(label, control, trusted) {
 };
 // The CDP click path runs its own JS snippet, so it reaches the same rules
 // through these helpers rather than restating the selectors.
+globalThis.__obscura_activateElement = function(el) {
+  return _nativeElementClick.call(el, _TRUSTED_ACTIVATION);
+};
 globalThis.__obscura_isDisabled = function(el) { return _isActuallyDisabled(el); };
 globalThis.__obscura_labeledControl = function(label) { return _labeledControl(label); };
 globalThis.__obscura_interactiveHost = function(el) {
@@ -3151,7 +3154,7 @@ globalThis.__obscura_interactiveHost = function(el) {
 };
 // Frozen so page script can neither replace the helpers to suppress or fake
 // label activation, nor delete them and make later clicks throw.
-for (const _name of ['__obscura_activateLabel', '__obscura_isDisabled',
+for (const _name of ['__obscura_activateLabel', '__obscura_activateElement', '__obscura_isDisabled',
                      '__obscura_labeledControl', '__obscura_interactiveHost',
                      '__obscura_inputChecked', '__obscura_setInputChecked',
                      '__obscura_inputIndeterminate', '__obscura_setInputIndeterminate']) {
@@ -4894,7 +4897,7 @@ class Element extends Node {
         );
       }
     }
-    const cancelled = !this.dispatchEvent(new Event('submit', { bubbles: true, cancelable: true }));
+    const cancelled = !this.dispatchEvent(globalThis.__obscura_markTrusted(new SubmitEvent('submit', { bubbles: true, cancelable: true, submitter: submitter == null ? null : submitter })));
     if (cancelled) return;
     this._navigateSubmit(submitter);
   }
@@ -10967,7 +10970,21 @@ globalThis.ProgressEvent = class ProgressEvent extends Event {
   }
 };
 globalThis.ClipboardEvent = class extends Event {};
-globalThis.SubmitEvent = class extends Event {};
+const _submitEventSubmitters = new WeakMap();
+globalThis.SubmitEvent = class SubmitEvent extends Event {
+  constructor(type, init = {}) {
+    super(type, init);
+    const submitter = init.submitter == null ? null : init.submitter;
+    if (submitter !== null && !(submitter instanceof Element)) {
+      throw new TypeError('SubmitEvent submitter must be an HTMLElement or null');
+    }
+    _submitEventSubmitters.set(this, submitter);
+  }
+  get submitter() {
+    if (!_submitEventSubmitters.has(this)) throw new TypeError('Illegal invocation');
+    return _submitEventSubmitters.get(this);
+  }
+};
 
 // ToggleEvent backs the popover beforetoggle/toggle events. oldState and
 // newState are "open"/"closed". These events do not bubble; beforetoggle is
