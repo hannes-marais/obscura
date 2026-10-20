@@ -9,7 +9,7 @@
 //   type is the fixed string "textarea", and the wrapper is a real
 //   HTMLTextAreaElement (constructor.name, instanceof) instead of Element.
 // - Layout: an empty textarea keeps an intrinsic box from rows/cols
-//   (Chromium: cols=20 rows=2 -> 168x36, rows=8 -> 126 tall), is
+//   (Chromium: cols=20 rows=2 -> 181x36, rows=8 -> 126 tall), is
 //   inline-block, and an authored height still wins.
 
 use std::io::{Read, Write};
@@ -111,11 +111,11 @@ async fn textarea_gets_intrinsic_control_box() {
         })()"#,
     );
 
-    // Chromium reference: an empty cols=20 rows=2 control is 168x36; each
+    // Chromium reference: an empty cols=20 rows=2 control is 181x36; each
     // extra row adds one 15px control line; authored height wins.
-    assert_eq!(probes["empty"], "168x36");
-    assert_eq!(probes["rows8"], "168x126");
-    assert_eq!(probes["css_height"], "168x36");
+    assert_eq!(probes["empty"], "181x36");
+    assert_eq!(probes["rows8"], "181x126");
+    assert_eq!(probes["css_height"], "181x36");
     assert_eq!(probes["display"], "inline-block");
     assert_eq!(probes["value_roundtrip"], "hi");
 }

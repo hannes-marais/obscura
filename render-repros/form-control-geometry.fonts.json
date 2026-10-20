@@ -1,0 +1,6 @@
+{
+  "fonts": [
+    {"family": "ObscuraFixtureSans", "file": "../crates/obscura-render/assets/liberation-sans.ttf", "selectors": ["input"]},
+    {"family": "ObscuraFixtureMono", "file": "../crates/obscura-render/assets/liberation-mono.ttf", "selectors": ["textarea"]}
+  ]
+}

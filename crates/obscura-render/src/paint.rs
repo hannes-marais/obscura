@@ -7367,6 +7367,18 @@ fn fallback_font_bytes(family: Option<&str>) -> &'static [u8] {
     FONT_BYTES
 }
 
+pub(crate) fn native_textarea_columns_width(columns: f32, size: f32, family: Option<&str>) -> f32 {
+    let font_size = (size * 64.0).floor() / 64.0;
+    let average = swash::FontRef::from_index(fallback_font_bytes(family), 0)
+        .map(|font| font.metrics(&[]).scale(font_size).average_width)
+        .filter(|width| width.is_finite() && *width > 0.0)
+        .unwrap_or(size * 0.6);
+    // Match native control character metrics: integer rounding is a minimum,
+    // not a truncation of a genuinely wider advance. Layout font sizes are
+    // quantized to 1/64 CSS pixel before the final intrinsic width is ceiled.
+    (columns * average.max(average.round()).max(1.0)).ceil()
+}
+
 pub(crate) fn native_text_input_width(columns: f32, size: f32, family: Option<&str>) -> f32 {
     let bytes = fallback_font_bytes(family);
     if let Some(font) = swash::FontRef::from_index(bytes, 0) {

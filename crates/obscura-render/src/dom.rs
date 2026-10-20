@@ -5254,14 +5254,14 @@ fn layout_dom_once(
         // is hidden, and Gecko subtracts the platform gutter from the viewport
         // containing block. Media queries and vw still see the full visual
         // viewport; percentages and auto widths use this reduced ICB.
-        const CLASSIC_SCROLLBAR_GUTTER: f32 = 15.0;
+        let classic_scrollbar_gutter = crate::style::CLASSIC_SCROLLBAR_GUTTER;
         let root_gutters = styles
             .get(&root_id)
             .map_or(0, |style| style.scrollbar_gutters.min(2));
         let initial_cb_width =
-            (viewport.0 - CLASSIC_SCROLLBAR_GUTTER * f32::from(root_gutters)).max(0.0);
+            (viewport.0 - classic_scrollbar_gutter * f32::from(root_gutters)).max(0.0);
         let initial_cb_x = if root_gutters == 2 {
-            CLASSIC_SCROLLBAR_GUTTER
+            classic_scrollbar_gutter
         } else {
             0.0
         };
@@ -6586,13 +6586,9 @@ fn layout_dom_once(
                 continue;
             }
             if element.local.as_ref() == "textarea" {
-                // A native textarea's intrinsic border box comes from the
-                // rows/cols content attributes (HTML defaults 2 and 20), not
-                // from its text content: an empty textarea is still a
-                // visible, clickable control (Chromium cols=20 rows=2 ->
-                // 168x36, rows=8 -> 126 tall). Per-column width is the
-                // fixed-pitch average advance calibrated to Chromium's
-                // control metrics; per-row height is the normal line height.
+                // Empty native textareas retain rows/cols geometry. Use the
+                // selected fallback face's column metrics and the same classic
+                // scrollbar policy as root gutters, rather than an em ratio.
                 let rows = node
                     .get_attribute("rows")
                     .and_then(|value| value.trim().parse::<usize>().ok())
@@ -6612,7 +6608,14 @@ fn layout_dom_once(
                     + style.padding.bottom
                     + style.border.top
                     + style.border.bottom;
-                let intrinsic_width = cols * font_size * 0.6075 + horizontal_edges;
+                #[cfg(feature = "paint")]
+                let column_width = crate::paint::native_textarea_columns_width(
+                    cols, font_size, style.font_family.as_deref(),
+                );
+                #[cfg(not(feature = "paint"))]
+                let column_width = cols * (font_size * 0.6).round().max(1.0);
+                let intrinsic_width = column_width + horizontal_edges
+                    + crate::style::native_control_scrollbar_allowance(style);
                 let intrinsic_height =
                     crate::inline::used_line_height(style).max(1.0) * rows + vertical_edges;
                 assign_native_control_size(
@@ -22207,10 +22210,49 @@ mod tests {
     }
 
     #[test]
+    fn textarea_intrinsic_width_tracks_columns_and_scrollbar_allowance() {
+        // Chromium with the exact bundled Liberation Mono bytes: 8px per
+        // column, 6px border/padding, and 15px for auto/scroll overflow.
+        let tree = parse_html(
+            r#"<style>html,body {margin:0}</style>
+            <div><textarea id="plain"></textarea></div>
+            <div><textarea id="two" cols="2"></textarea></div>
+            <div><textarea id="ten" cols="10"></textarea></div>
+            <div><textarea id="hidden" style="overflow:hidden"></textarea></div>
+            <div><textarea id="author" style="width:100px"></textarea></div>"#,
+        );
+        let laid = layout_dom(&tree, (1280.0, 720.0));
+        for (id, expected) in [("plain", 181.0), ("two", 37.0), ("ten", 101.0),
+            ("hidden", 166.0), ("author", 100.0)] {
+            let width = laid.rects[&tree.get_element_by_id(id).unwrap()].width;
+            assert!((width - expected).abs() < 0.5,
+                "{id}: expected {expected}, got {width}");
+        }
+    }
+
+    #[cfg(feature = "paint")]
+    #[test]
+    fn textarea_intrinsic_width_tracks_resolved_font_metrics() {
+        let tree = parse_html(
+            r#"<div><textarea id="mono10" style="font:10px monospace"></textarea></div>
+            <div><textarea id="mono20" style="font:20px monospace"></textarea></div>
+            <div><textarea id="sans20" style="font:20px Arial"></textarea></div>
+            <div><textarea id="hidden20" style="font:20px monospace;overflow:hidden"></textarea></div>"#,
+        );
+        let laid = layout_dom(&tree, (1280.0, 720.0));
+        for (id, expected) in [("mono10", 142.0), ("mono20", 262.0),
+            ("sans20", 261.0), ("hidden20", 247.0)] {
+            let width = laid.rects[&tree.get_element_by_id(id).unwrap()].width;
+            assert!((width - expected).abs() < 0.5,
+                "{id}: expected {expected}, got {width}");
+        }
+    }
+
+    #[test]
     fn textarea_intrinsic_box_comes_from_rows_and_cols() {
         // #685: an empty textarea must keep a real control box instead of
-        // laying out as a plain block. Chromium calibrates cols=20/rows=2 to
-        // a 168x36 border box with one 15px control line per row.
+        // laying out as a plain block. Matched Liberation Mono gives a
+        // 181x36 classic-scrollbar box with one 15px control line per row.
         let tree = parse_html(
             r#"<style>html, body { margin: 0 }</style>
             <div><textarea id="plain"></textarea></div>
@@ -22222,11 +22264,11 @@ mod tests {
         let rect = |id: &str| laid.rects[&tree.get_element_by_id(id).unwrap()];
 
         let plain = rect("plain");
-        assert!((plain.width - 168.0).abs() < 0.5, "{}", plain.width);
+        assert!((plain.width - 181.0).abs() < 0.5, "{}", plain.width);
         assert!((plain.height - 36.0).abs() < 0.5, "{}", plain.height);
 
         let rows8 = rect("rows8");
-        assert!((rows8.width - 168.0).abs() < 0.5);
+        assert!((rows8.width - 181.0).abs() < 0.5);
         assert!((rows8.height - 126.0).abs() < 0.5, "{}", rows8.height);
 
         // Author height wins over the rows-derived intrinsic height, and the

@@ -255,6 +255,9 @@ pub fn ua_style(tag: &str) -> LayoutStyle {
         style.is_inline_block = true;
         style.font_size = Some(13.333_333);
         style.font_family = Some("monospace".to_string());
+        style.overflow_specified_x = OVERFLOW_AUTO;
+        style.overflow_specified_y = OVERFLOW_AUTO;
+        recompute_overflow(&mut style);
         style.line_height = Some(crate::LineHeight::Normal);
         style.white_space = Some(crate::WhiteSpace::PreWrap);
         style.box_sizing = crate::BoxSizing::BorderBox;
@@ -631,6 +634,8 @@ struct ParsedOverflowAxis {
     inherit: bool,
 }
 
+pub(crate) const CLASSIC_SCROLLBAR_GUTTER: f32 = 15.0;
+
 const OVERFLOW_VISIBLE: u8 = 0;
 const OVERFLOW_CLIP: u8 = 1;
 const OVERFLOW_HIDDEN: u8 = 2;
@@ -692,6 +697,13 @@ fn parse_overflow_declaration(
             Some((Some(first), Some(second)))
         }
         _ => None,
+    }
+}
+
+pub(crate) fn native_control_scrollbar_allowance(style: &LayoutStyle) -> f32 {
+    match computed_overflow_axes(style).1 {
+        OVERFLOW_AUTO | OVERFLOW_SCROLL => CLASSIC_SCROLLBAR_GUTTER,
+        _ => 0.0,
     }
 }
 
