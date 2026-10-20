@@ -310,6 +310,7 @@ pub struct Page {
     pub intercept_enabled: bool,
     pub intercept_block_patterns: Vec<String>,
     pub blocked_url_patterns: Vec<String>,
+    dialog_handler: Option<obscura_js::dialog::DialogHandler>,
     intercept_tx: Option<tokio::sync::mpsc::UnboundedSender<obscura_js::ops::InterceptedRequest>>,
     // Scripts to execute in the page's JS context BEFORE any of the page's
     // own scripts run — the CDP `Page.addScriptToEvaluateOnNewDocument`
@@ -1128,6 +1129,7 @@ impl Page {
             intercept_enabled: false,
             intercept_block_patterns: Vec::new(),
             blocked_url_patterns: Vec::new(),
+            dialog_handler: None,
             intercept_tx: None,
             preload_scripts: Vec::new(),
             runtime_events_enabled: std::cell::Cell::new(false),
@@ -1835,6 +1837,7 @@ impl Page {
             rt.set_stealth_client(stealth.clone());
         }
 
+        rt.set_dialog_handler(self.dialog_handler.clone());
         rt.set_intercept_page_id(&self.id);
         if let Some(tx) = &self.intercept_tx {
             rt.set_intercept_tx(tx.clone());
@@ -4931,6 +4934,11 @@ impl Page {
         })??;
         self.push_history(self.url_string());
         Ok(())
+    }
+
+    pub fn set_dialog_handler(&mut self, handler: Option<obscura_js::dialog::DialogHandler>) {
+        self.dialog_handler = handler.clone();
+        if let Some(js) = &self.js { js.set_dialog_handler(handler); }
     }
 
     pub fn set_intercept_tx(

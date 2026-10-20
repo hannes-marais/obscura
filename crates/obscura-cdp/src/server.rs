@@ -189,6 +189,7 @@ struct CdpMessage {
 }
 
 enum ServerMessage {
+    InstallDialogBroker(crate::dialog::DialogBroker),
     Cdp(CdpMessage),
     NewConnection {
         reply_tx: mpsc::UnboundedSender<String>,
@@ -1324,6 +1325,7 @@ async fn cdp_processor(
         };
 
         match msg {
+            ServerMessage::InstallDialogBroker(broker) => { ctx.dialog_broker = Some(broker); }
             ServerMessage::NewConnection { reply_tx } => {
                 connection_reply_tx = Some(reply_tx.clone());
                 let _ = reply_tx.send(
@@ -1778,6 +1780,7 @@ async fn process_with_interception(
         }
     };
 
+    prepare_dialog_handler(&req, ctx, reply_tx);
     tracing::info!("INTERCEPTION navigate: {} (id={})", req.method, req.id);
 
     let session_id = &req.session_id;
@@ -1919,6 +1922,7 @@ async fn process_with_interception(
             Some(msg) = rx.recv() => {
                 tracing::info!("INTERCEPTION select: received CDP message during navigation");
                 match msg {
+                    ServerMessage::InstallDialogBroker(broker) => { ctx.dialog_broker = Some(broker); }
                     ServerMessage::NewConnection { reply_tx: new_tx } => {
                         // Safe: no V8 enter, just bookkeeping.
                         let pid = ctx.create_page();
@@ -2084,6 +2088,20 @@ async fn process_awaited_with_interception(
     }
 }
 
+fn prepare_dialog_handler(req: &CdpRequest, ctx: &mut CdpContext, reply_tx: &mpsc::UnboundedSender<String>) {
+    // Install before entering V8, including scripts executed by navigation.
+    // The handler captures only the current attached session and protocol sender.
+    if let (Some(broker), Some(session)) = (ctx.dialog_broker.clone(), req.session_id.as_ref()) {
+        if let Some(page) = ctx.get_session_page_mut(&req.session_id) {
+            let budget = std::env::var("OBSCURA_CDP_COMMAND_TIMEOUT_MS").ok()
+                .and_then(|value| value.parse::<u64>().ok()).filter(|value| *value > 0)
+                .unwrap_or(60_000);
+            page.set_dialog_handler(Some(broker.handler(session.clone(), page.id.clone(), page.context.id.clone(), reply_tx.clone(),
+                std::time::Duration::from_millis(budget))));
+        }
+    }
+}
+
 async fn process_cdp_message(
     text: &str,
     ctx: &mut CdpContext,
@@ -2099,6 +2117,7 @@ async fn process_cdp_message(
 
     tracing::debug!("CDP: {} (id={}, s={:?})", req.method, req.id, req.session_id);
 
+    prepare_dialog_handler(&req, ctx, reply_tx);
     service_live_page_render_resources(ctx);
     let response = dispatch::dispatch(&req, ctx).await;
     service_live_page_render_resources(ctx);
@@ -2204,6 +2223,12 @@ async fn handle_connection_ws(
     let (mut ws_sender, mut ws_receiver) = ws_stream.split();
 
     let (reply_tx, mut reply_rx) = mpsc::unbounded_channel::<String>();
+    let dialogs = crate::dialog::DialogBroker::default();
+    // Drop also wakes pending synchronous host calls on error/cancellation.
+    struct DialogDisconnect(crate::dialog::DialogBroker);
+    impl Drop for DialogDisconnect { fn drop(&mut self) { self.0.disconnect(); } }
+    let _dialog_disconnect = DialogDisconnect(dialogs.clone());
+    let _ = msg_tx.send(ServerMessage::InstallDialogBroker(dialogs.clone()));
 
     let _ = msg_tx.send(ServerMessage::NewConnection {
         reply_tx: reply_tx.clone(),
@@ -2244,6 +2269,13 @@ async fn handle_connection_ws(
                     break;
                 }
 
+                if let Ok(req) = serde_json::from_str::<CdpRequest>(&text) {
+                    dialogs.cancel_lifecycle(&req.method, req.session_id.as_deref(), &req.params);
+                    if req.method == "Page.handleJavaScriptDialog" {
+                        dialogs.handle(req.id, req.session_id.as_deref(), &req.params, &reply_tx);
+                        continue;
+                    }
+                }
                 if let Some(resp) = fast_path_response(&text) {
                     let _ = reply_tx.send(resp);
                 } else {
@@ -2422,6 +2454,72 @@ mod tests {
 
         let malformed = "GET /json/version HTTP/1.1\r\nHost: attacker.test/path\r\n\r\n";
         assert_eq!(websocket_authority(malformed, 9223), "127.0.0.1:9223");
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn native_dialog_socket_resumes_original_javascript_with_requested_choice() {
+        use futures_util::{SinkExt, StreamExt};
+        use std::sync::{Arc, atomic::AtomicUsize};
+        use std::time::Duration;
+        use tokio_tungstenite::tungstenite::Message;
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let accept = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let context = crate::dispatch::CdpContext::new().default_context;
+            super::run_connection(stream.into_std().unwrap(), context.clone(), context,
+                Arc::new(std::sync::Mutex::new(())), Arc::new(tokio::sync::Notify::new()),
+                Arc::new(AtomicUsize::new(1)));
+        });
+        let (mut ws, _) = tokio_tungstenite::connect_async(format!("ws://{address}/devtools/browser")).await.unwrap();
+        accept.await.unwrap();
+        ws.send(Message::Text(json!({"id":1,"method":"Target.createTarget","params":{"url":"about:blank"}}).to_string().into())).await.unwrap();
+        let mut session = None;
+        loop {
+            let message = tokio::time::timeout(Duration::from_secs(3), ws.next()).await.unwrap().unwrap().unwrap();
+            if let Message::Text(text) = message {
+                let value: serde_json::Value = serde_json::from_str(&text).unwrap();
+                if let Some(sid) = value["params"]["sessionId"].as_str() { session = Some(sid.to_string()); }
+                if value["id"] == 1 { break; }
+            }
+        }
+        let session = session.unwrap();
+        for (round, choice) in [false, true].into_iter().enumerate() {
+            let command_id = 10 + round as u64 * 2;
+            ws.send(Message::Text(json!({"id":command_id,"method":"Runtime.evaluate","sessionId":session,
+                "params":{"expression":"globalThis.dialogVisits=(globalThis.dialogVisits||0)+1; confirm('Continue?')", "returnByValue":true}}).to_string().into())).await.unwrap();
+            loop {
+                let message = tokio::time::timeout(Duration::from_secs(3), ws.next()).await.unwrap().unwrap().unwrap();
+                if let Message::Text(text) = message {
+                    let value: serde_json::Value = serde_json::from_str(&text).unwrap();
+                    assert_ne!(value["id"], command_id, "JavaScript returned before a dialog choice");
+                    if value["method"] == "Page.javascriptDialogOpening" {
+                        assert_eq!(value["sessionId"], session);
+                        assert_eq!(value["params"]["message"], "Continue?");
+                        break;
+                    }
+                }
+            }
+            ws.send(Message::Text(json!({"id":command_id+1,"method":"Page.handleJavaScriptDialog","sessionId":session,"params":{"accept":choice}}).to_string().into())).await.unwrap();
+            let mut closed = false;
+            let mut handled = false;
+            loop {
+                let message = tokio::time::timeout(Duration::from_secs(3), ws.next()).await.unwrap().unwrap().unwrap();
+                if let Message::Text(text) = message {
+                    let value: serde_json::Value = serde_json::from_str(&text).unwrap();
+                    if value["method"] == "Page.javascriptDialogClosed" {
+                        assert_eq!(value["params"]["result"], choice); closed = true;
+                    }
+                    if value["id"] == command_id+1 { assert!(value.get("error").is_none()); handled = true; }
+                    if value["id"] == command_id {
+                        assert!(closed && handled, "original continuation outran close/ack");
+                        assert_eq!(value["result"]["result"]["value"], choice);
+                        break;
+                    }
+                }
+            }
+        }
+        ws.close(None).await.unwrap();
     }
 
     #[tokio::test(flavor = "current_thread")]

@@ -1375,6 +1375,10 @@ impl ObscuraJsRuntime {
     /// and every navigation auto-enabled interception, which made
     /// `fetch()` from page JS hang forever waiting for a CDP client to
     /// answer Fetch.requestPaused events that the client never asked for.
+    pub fn set_dialog_handler(&self, handler: Option<crate::dialog::DialogHandler>) {
+        self.state.borrow_mut().dialog_handler = handler;
+    }
+
     pub fn set_intercept_tx(
         &self,
         tx: tokio::sync::mpsc::UnboundedSender<crate::ops::InterceptedRequest>,

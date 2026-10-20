@@ -49,6 +49,7 @@ pub(crate) struct ExecutionContextRecord {
 }
 
 pub struct CdpContext {
+    pub(crate) dialog_broker: Option<crate::dialog::DialogBroker>,
     pub pages: Vec<Page>,
     pub sessions: HashMap<String, String>, // session_id -> page_id
     /// Current document loader per page. Navigation events and later
@@ -172,6 +173,7 @@ impl CdpContext {
     pub fn new_with_shared_context(default_context: Arc<BrowserContext>) -> Self {
         let valid_context_ids = HashSet::new();
         CdpContext {
+            dialog_broker: None,
             pages: Vec::new(),
             sessions: HashMap::new(),
             current_loader_ids: HashMap::new(),

@@ -15788,9 +15788,9 @@ for (const [name, offset] of [
 globalThis.focus = function() {}; _markNative(globalThis.focus);
 globalThis.blur = function() {}; _markNative(globalThis.blur);
 globalThis.print = function() {}; _markNative(globalThis.print);
-globalThis.alert = function() {}; _markNative(globalThis.alert);
-globalThis.confirm = function() { return true; }; _markNative(globalThis.confirm);
-globalThis.prompt = function() { return null; }; _markNative(globalThis.prompt);
+globalThis.alert = function(message) { __obscuraCore.ops.op_browser_dialog("alert", arguments.length ? String(message) : "", ""); }; _markNative(globalThis.alert);
+globalThis.confirm = function(message) { return JSON.parse(__obscuraCore.ops.op_browser_dialog("confirm", arguments.length ? String(message) : "", "")).accept; }; _markNative(globalThis.confirm);
+globalThis.prompt = function(message, value) { const choice = JSON.parse(__obscuraCore.ops.op_browser_dialog("prompt", arguments.length ? String(message) : "", arguments.length > 1 ? String(value) : "")); return choice.accept ? choice.promptText : null; }; _markNative(globalThis.prompt);
 globalThis.open = function() { return null; }; _markNative(globalThis.open);
 globalThis.close = function() {}; _markNative(globalThis.close);
 globalThis.stop = function() {}; _markNative(globalThis.stop);

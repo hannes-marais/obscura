@@ -150,6 +150,7 @@ impl NavigationTiming {
 }
 
 pub struct ObscuraState {
+    pub dialog_handler: Option<crate::dialog::DialogHandler>,
     pub dom: Option<DomTree>,
     pub url: String,
     /// Initial about:blank documents retain their creator's base URL and origin.
@@ -435,6 +436,7 @@ impl ObscuraState {
             pending_navigation: None,
             session_history: SessionHistory::default(),
             pending_history_traversal: None,
+            dialog_handler: None,
             intercept_tx: None,
             intercept_enabled: false,
             intercept_page_id: String::new(),
@@ -3008,6 +3010,30 @@ fn op_report_browser_exception<'s, 'i>(
     if let Ok(mut page) = owner.try_borrow_mut() {
         record_uncaught_exception(&mut page, &error, &url);
     };
+}
+
+#[op2]
+#[string]
+fn op_browser_dialog(
+    state: &OpState,
+    #[string] kind: &str,
+    #[string] message: &str,
+    #[string] default_prompt: &str,
+) -> Result<String, deno_error::JsErrorBox> {
+    let shared = state.borrow::<SharedState>().clone();
+    let (handler, url) = {
+        let page = shared.borrow();
+        (page.dialog_handler.clone(), page.url.clone())
+    };
+    let choice = match handler {
+        Some(handler) => handler(crate::dialog::DialogRequest {
+            kind: kind.into(), message: message.into(),
+            default_prompt: default_prompt.into(), url,
+        }).map_err(deno_error::JsErrorBox::generic)?,
+        // No browser UI exists in a non-CDP embedder: suppress the dialog.
+        None => crate::dialog::DialogChoice { accept: false, prompt_text: String::new() },
+    };
+    Ok(serde_json::json!({"accept":choice.accept,"promptText":choice.prompt_text}).to_string())
 }
 
 #[op2(fast)]
@@ -6873,6 +6899,7 @@ pub fn build_extension() -> Extension {
         op_cssom_stylesheet_update(),
         op_cssom_stylesheet_clear(),
         op_runtime_events_enabled(),
+        op_browser_dialog(),
         op_console_msg(),
         op_report_browser_exception(),
         op_fetch_url(),
