@@ -7357,6 +7357,31 @@ fn fallback_font_bytes(family: Option<&str>) -> &'static [u8] {
     FONT_BYTES
 }
 
+pub(crate) fn native_text_input_width(columns: f32, size: f32, family: Option<&str>) -> f32 {
+    let bytes = fallback_font_bytes(family);
+    if let Some(font) = swash::FontRef::from_index(bytes, 0) {
+        let metrics = font.metrics(&[]).scale(size);
+        let zero = measure_text("0", size, false, family);
+        let average = metrics.average_width;
+        if average.is_finite() && average > 0.0 && average <= zero * 1.7 {
+            let average = average.max(average.round());
+            // Browser maximum-character metrics use the global glyph bounds,
+            // rather than hhea.advanceWidthMax (a pen advance, not ink bounds).
+            let maximum = font.table(u32::from_be_bytes(*b"head"))
+                .filter(|head| head.len() >= 44)
+                .and_then(|head| {
+                    let units = u16::from_be_bytes([head[18], head[19]]) as f32;
+                    let min = i16::from_be_bytes([head[36], head[37]]) as f32;
+                    let max = i16::from_be_bytes([head[40], head[41]]) as f32;
+                    (units > 0.0).then_some((max - min).max(0.0) * size / units)
+                }).unwrap_or(metrics.max_width);
+            return (average * columns + (maximum - average).max(0.0)).ceil();
+        }
+        return (zero * columns).ceil();
+    }
+    (size * 0.6 * columns + size * 0.675).ceil()
+}
+
 pub fn measure_text(text: &str, size: f32, is_bold: bool, family: Option<&str>) -> f32 {
     let font = FontRef::try_from_slice(fallback_font_bytes(family)).unwrap();
     let scale = PxScale::from(size);

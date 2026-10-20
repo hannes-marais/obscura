@@ -6606,10 +6606,11 @@ fn layout_dom_once(
                         .and_then(|value| value.parse::<u32>().ok())
                         .filter(|&value| value > 0)
                         .unwrap_or(20) as f32;
-                    (
-                        size * font_size * 0.6 + font_size * 0.675 + horizontal_edges,
-                        default_height,
-                    )
+                    #[cfg(feature = "paint")]
+                    let width = crate::paint::native_text_input_width(size, font_size, style.font_family.as_deref());
+                    #[cfg(not(feature = "paint"))]
+                    let width = size * font_size * 0.6 + font_size * 0.675;
+                    (width + horizontal_edges, default_height)
                 }
             };
             assign_native_control_size(
@@ -12075,14 +12076,11 @@ fn assign_native_control_size(
 ) {
     let (stretch_inline, stretch_block) = stretched_grid_item;
     let content_box = style.box_sizing == crate::BoxSizing::ContentBox;
-    if stretch_inline || stretch_block {
-        // Stretch controls the final size, not the intrinsic track contribution.
-        // Measure content axes independently; native controls have no natural ratio.
-        style.intrinsic_size = Some((
-            (intrinsic_width - horizontal_edges).max(0.0),
-            (intrinsic_height - vertical_edges).max(0.0),
-        ));
-    }
+    // Keep natural metrics independently of authored percentage sizes.
+    style.intrinsic_size = Some((
+        (intrinsic_width - horizontal_edges).max(0.0),
+        (intrinsic_height - vertical_edges).max(0.0),
+    ));
     if style.width == crate::Dimension::Auto && !stretch_inline {
         let declared = if content_box {
             (intrinsic_width - horizontal_edges).max(0.0)
@@ -12475,13 +12473,24 @@ fn defer_cyclic_flex_inline_sizes(
             && matches!(source, DeferredCyclicInlineSource::Percent(_)))
         .then(|| definite_row_flex_intrinsic_width(tree, id, styles))
         .flatten();
+        let native_width = (slot == 0)
+            .then(|| tree.borrow_node(id))
+            .flatten()
+            .filter(|node| node.as_element().is_some_and(|element|
+                matches!(element.local.as_ref(), "input" | "select" | "textarea")))
+            .and_then(|_| styles.get(&id))
+            .and_then(|style| style.intrinsic_size.map(|(width, _)| {
+                width + if style.box_sizing == crate::BoxSizing::BorderBox {
+                    style.padding.left + style.padding.right + style.border.left + style.border.right
+                } else { 0.0 }
+            }));
         if let Some(style) = styles.get_mut(&id) {
             // A cyclic percentage preferred size uses the container's
             // max-content contribution. Preserve that contribution for a
             // definite no-wrap row; a zero width would erase all of its fixed
             // cells. Other cyclic forms retain the percentage-zero intrinsic
             // value and are restored after outer flex sizing.
-            let intrinsic = crate::Dimension::Px(definite_row_width.unwrap_or(intrinsic).max(0.0));
+            let intrinsic = crate::Dimension::Px(native_width.or(definite_row_width).unwrap_or(intrinsic).max(0.0));
             match slot {
                 0 => style.width = intrinsic,
                 2 => style.min_width = intrinsic,
@@ -16037,6 +16046,29 @@ mod tests {
             "children heights should be 40 and 60, got {:?}",
             sorted
         );
+    }
+
+    #[cfg(feature = "paint")]
+    #[test]
+    fn percentage_inputs_keep_intrinsic_contribution_inside_auto_flex_fields() {
+        let tree = parse_html(r#"<style>
+            .row{display:flex;flex-wrap:wrap;gap:8px;width:420px}
+            .scope{display:contents}.field{display:flex;flex-direction:column;gap:4px}
+            .control{display:flex;min-height:38px;box-sizing:border-box;align-items:center;padding:0 12px;border:1px solid gray}
+            input{width:100%;box-sizing:border-box;padding:9px 0;font:14px "Liberation Sans";border:0}
+            </style><div class="row">
+            <div class="scope"><div class="field"><label>Grade</label><span class="control"><input id="grade" placeholder="Any grade"></span></div></div>
+            <div class="scope"><div class="field"><label>Unit</label><span class="control"><input id="unit" placeholder="Any unit"></span></div></div>
+            <div class="scope"><div class="field"><label>Kind</label><span class="control"><input id="kind" placeholder="Any kind"></span></div></div></div>"#);
+        let laid = layout_dom(&tree, (1280.0, 800.0));
+        let rect = |id: &str| laid.rects[&tree.get_element_by_id(id).unwrap()];
+        for id in ["grade", "unit", "kind"] {
+            // Chromium using this exact bundled font file measures 175px;
+            // system Arial and Liberation Sans versions have other metrics.
+            assert!((rect(id).width - 175.0).abs() < 1.0, "{id}: {:?}", rect(id));
+        }
+        assert!((rect("grade").y - rect("unit").y).abs() < 1.0);
+        assert!(rect("kind").y > rect("grade").y + 30.0);
     }
 
     #[test]
