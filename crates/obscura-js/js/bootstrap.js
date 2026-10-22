@@ -13306,6 +13306,10 @@ globalThis.HTMLParagraphElement = Element;
 globalThis.HTMLAnchorElement = Element;
 globalThis.HTMLImageElement = HTMLImageElement;
 globalThis.HTMLInputElement = class HTMLInputElement extends Element {
+  // Renderers assign this IDL property; keep CSS [multiple] and file-upload
+  // automation in sync with the same content attribute a browser exposes.
+  get multiple() { return this.hasAttribute('multiple'); }
+  set multiple(v) { if (v) this.setAttribute('multiple', ''); else this.removeAttribute('multiple'); }
   get readOnly() { return this.hasAttribute('readonly'); }
   set readOnly(v) { if (v) this.setAttribute('readonly', ''); else this.removeAttribute('readonly'); }
   get size() {
@@ -13350,7 +13354,10 @@ globalThis.HTMLFormElement = class HTMLFormElement extends Element {
 // Native element interfaces must remain distinct: clients often test details
 // before reading a select's value. An Element alias makes every select look
 // like a details element and submits its `open` state instead of its choice.
-globalThis.HTMLSelectElement = class HTMLSelectElement extends Element {};
+globalThis.HTMLSelectElement = class HTMLSelectElement extends Element {
+  get multiple() { return this.hasAttribute('multiple'); }
+  set multiple(v) { if (v) this.setAttribute('multiple', ''); else this.removeAttribute('multiple'); }
+};
 globalThis.HTMLTextAreaElement = class HTMLTextAreaElement extends Element {
   get readOnly() { return this.hasAttribute('readonly'); }
   set readOnly(v) { if (v) this.setAttribute('readonly', ''); else this.removeAttribute('readonly'); }

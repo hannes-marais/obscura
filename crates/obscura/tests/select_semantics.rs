@@ -13,6 +13,38 @@ use std::io::{Read, Write};
 
 use obscura::Browser;
 
+#[tokio::test(flavor = "current_thread")]
+async fn multiple_property_reflects_for_file_inputs_and_selects() {
+    std::env::set_var("OBSCURA_ALLOW_PRIVATE_NETWORK", "1");
+    let browser = Browser::new().unwrap();
+    let mut page = browser.new_page().await.unwrap();
+    page.goto(&spawn_server()).await.unwrap();
+    let probes = page.evaluate(r#"(() => {
+        return ['input', 'select'].map(tag => {
+            const element = document.createElement(tag);
+            if (tag === 'input') element.type = 'file';
+            document.body.appendChild(element);
+            const initial = element.multiple === false;
+            element.multiple = true;
+            const enabled = element.hasAttribute('multiple') && element.matches('[multiple]');
+            element.multiple = false;
+            const disabled = !element.hasAttribute('multiple');
+            element.setAttribute('multiple', 'false');
+            const present = element.multiple === true;
+            element.removeAttribute('multiple');
+            const removed = element.multiple === false;
+            element.multiple = 'false';
+            const coerced = element.hasAttribute('multiple');
+            return {initial, enabled, disabled, present, removed, coerced};
+        });
+    })()"#);
+    for probe in probes.as_array().unwrap() {
+        for key in ["initial", "enabled", "disabled", "present", "removed", "coerced"] {
+            assert_eq!(probe[key], true, "{key}: {probe}");
+        }
+    }
+}
+
 fn spawn_server() -> String {
     let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
     let addr = listener.local_addr().unwrap();
