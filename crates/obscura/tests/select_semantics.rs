@@ -99,3 +99,45 @@ async fn select_without_explicit_selection_defaults_to_first_option() {
     assert_eq!(probes["index"], 0);
     assert_eq!(probes["value"], "a");
 }
+
+
+#[tokio::test(flavor = "current_thread")]
+async fn selected_options_is_a_live_html_collection() {
+    std::env::set_var("OBSCURA_ALLOW_PRIVATE_NETWORK", "1");
+    let browser = Browser::new().unwrap();
+    let mut page = browser.new_page().await.unwrap();
+    page.goto(&spawn_server()).await.unwrap();
+    let result = page.evaluate(r#"(() => {
+        const select = document.getElementById('single');
+        const chosen = select.selectedOptions;
+        const initial = chosen.length === 1 && chosen[0].textContent === 'A';
+        const same = chosen === select.selectedOptions && chosen instanceof HTMLCollection;
+        select.value = 'b';
+        select.options[1].id = 'selected-id';
+        const changed = chosen.length === 1 && chosen.item(0).value === 'b'
+            && chosen.namedItem('selected-id') === chosen[0]
+            && chosen['selected-id'] === chosen[0];
+        select.selectedIndex = -1;
+        const cleared = chosen.length === 0 && chosen.item(0) === null && select.value === '';
+        select.value = 'missing';
+        const missing = chosen.length === 0 && select.selectedIndex === -1;
+        const multi = document.getElementById('multi');
+        const many = multi.selectedOptions;
+        const empty = many.length === 0;
+        multi.options[0].selected = true;
+        const group = document.createElement('optgroup');
+        const added = new Option('Y', 'y');
+        added.selected = true;
+        group.appendChild(added);
+        multi.appendChild(group);
+        const grouped = many.length === 2 && Array.from(many).map(o => o.value).join(',') === 'x,y';
+        multi.options[0].remove();
+        const removed = many.length === 1 && many[0] === added;
+        added.selected = false;
+        const deselected = many.length === 0;
+        return {initial, same, changed, cleared, missing, empty, grouped, removed, deselected};
+    })()"#);
+    for key in ["initial", "same", "changed", "cleared", "missing", "empty", "grouped", "removed", "deselected"] {
+        assert_eq!(result[key], true, "selectedOptions: {key}: {result}");
+    }
+}

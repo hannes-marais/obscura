@@ -4385,7 +4385,8 @@ class Element extends Node {
           return opts[i].getAttribute('value') !== null ? opts[i].getAttribute('value') : opts[i].textContent;
         }
       }
-      if (opts.length) return opts[0].getAttribute('value') !== null ? opts[0].getAttribute('value') : opts[0].textContent;
+      const index = this.selectedIndex;
+      if (index >= 0) return opts[index].value;
       return '';
     }
     if (_formValues[this._nid] === undefined) _loadFormState(this._nid);
@@ -4847,6 +4848,23 @@ class Element extends Node {
     if (this.localName !== 'select') return [];
     return HTMLCollection._from(this.querySelectorAll('option'));
   }
+  get selectedOptions() {
+    if (this.localName !== 'select') return undefined;
+    // The collection is SameObject and live. Do not return an Array snapshot:
+    // Drive picker clients keep this object while selection/DOM state changes.
+    if (!this._selectedOptionsCollection) {
+      this._selectedOptionsCollection = HTMLCollection._live(() => {
+        const options = this.options;
+        const selected = Array.from(options).filter(option => option.selected);
+        if (!selected.length && !this.hasAttribute('multiple')) {
+          const index = this.selectedIndex;
+          if (index >= 0) selected.push(options[index]);
+        }
+        return HTMLCollection._from(selected);
+      });
+    }
+    return this._selectedOptionsCollection;
+  }
   add(item, before = null) {
     if (this.localName !== 'select') {
       throw new TypeError("Illegal invocation");
@@ -4866,12 +4884,14 @@ class Element extends Node {
   }
   get selectedIndex() {
     const opts = this.options;
+    let explicitlyAssigned = false;
     for (let i = 0; i < opts.length; i++) {
+      if (opts[i]._selected !== undefined) explicitlyAssigned = true;
       if (opts[i].selected) return i;
     }
-    // Only a single select implicitly selects its first option; a multiple
-    // select with nothing chosen idles at -1 like a real browser.
-    return opts.length && !this.hasAttribute('multiple') ? 0 : -1;
+    // Explicit -1/value-with-no-match must remain empty. Only an untouched
+    // single select implicitly selects its first option.
+    return opts.length && !this.hasAttribute('multiple') && !explicitlyAssigned ? 0 : -1;
   }
   set selectedIndex(v) {
     const opts = this.options;
@@ -13721,6 +13741,27 @@ globalThis.HTMLCollection = class HTMLCollection extends Array {
   // work at build time (eager defineProperty per id was an O(n) build cost that
   // made querySelectorAll on large result sets ~26x slower). The Proxy only
   // resolves a name when an unknown string key is actually read.
+  // Opt-in live collections leave the existing snapshot fast path unchanged.
+  static _live(read) {
+    const target = new HTMLCollection();
+    return new Proxy(target, {
+      get(t, key, receiver) {
+        if (key === 'length' || (typeof key === 'string' && /^(0|[1-9][0-9]*)$/.test(key))) {
+          return Reflect.get(read(), key);
+        }
+        const value = Reflect.get(t, key, receiver);
+        if (value !== undefined || typeof key !== 'string') return value;
+        return read().namedItem(key) || undefined;
+      },
+      has(t, key) {
+        return Reflect.has(read(), key);
+      },
+      ownKeys() { return Reflect.ownKeys(read()); },
+      getOwnPropertyDescriptor(t, key) {
+        return Reflect.getOwnPropertyDescriptor(read(), key);
+      },
+    });
+  }
   static _from(arr) {
     const c = new HTMLCollection();
     if (arr) for (let i = 0; i < arr.length; i++) { if (arr[i]) c[c.length] = arr[i]; }
