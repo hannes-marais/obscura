@@ -3689,10 +3689,14 @@ impl ObscuraJsRuntime {
         self.runtime().v8_isolate().perform_microtask_checkpoint();
         if crate::cdp_watchdog::disarm(checkpoint_watchdog) {
             self.cancel_termination();
-            return Err("autonomous microtask checkpoint exceeded its task budget".into());
+            let message = format!("autonomous microtask checkpoint exceeded its task budget ({AUTONOMOUS_TASK_WATCHDOG_MS}ms)");
+            crate::ops::record_autonomous_task_failure(&mut self.state.borrow_mut(), &message);
+            return Err(message);
         }
         if self.recover_heap_limit() {
-            return Err("JavaScript heap limit exceeded; execution terminated".into());
+            let message = "JavaScript heap limit exceeded; execution terminated";
+            crate::ops::record_autonomous_task_failure(&mut self.state.borrow_mut(), message);
+            return Err(message.into());
         }
 
         let isolate_handle = self.isolate_handle();
@@ -3709,9 +3713,9 @@ impl ObscuraJsRuntime {
             let watchdog_fired = crate::cdp_watchdog::disarm(watchdog);
             if watchdog_fired {
                 self.runtime().v8_isolate().cancel_terminate_execution();
-                return std::task::Poll::Ready(Err(
-                    "autonomous browser task exceeded its task budget".into(),
-                ));
+                return std::task::Poll::Ready(Err(format!(
+                    "autonomous browser task exceeded its task budget ({AUTONOMOUS_TASK_WATCHDOG_MS}ms)",
+                )));
             }
             match tick {
                 std::task::Poll::Ready(Ok(())) => std::task::Poll::Ready(Ok(true)),
@@ -3721,6 +3725,7 @@ impl ObscuraJsRuntime {
                 std::task::Poll::Ready(Err(error))
                     if !is_fatal_event_loop_error(&error.to_string()) =>
                 {
+                    crate::ops::record_autonomous_task_failure(&mut self.state.borrow_mut(), &error.to_string());
                     tracing::warn!("page task error, continuing the event loop: {error}");
                     std::task::Poll::Ready(Ok(false))
                 }
@@ -3742,7 +3747,11 @@ impl ObscuraJsRuntime {
         if matches!(result, Ok(false)) {
             tokio::task::yield_now().await;
         }
-        self.finish_heap_checked(result)
+        let result = self.finish_heap_checked(result);
+        if let Err(message) = &result {
+            crate::ops::record_autonomous_task_failure(&mut self.state.borrow_mut(), message);
+        }
+        result
     }
 
     /// Drive one cooperative event-loop turn for browser lifecycle code that
@@ -5764,6 +5773,24 @@ mod tests {
         rt.run_event_loop().await.unwrap();
         assert_eq!(rt.evaluate("microtaskOrder").unwrap(),
             serde_json::json!(["before", "error", "after", "promise"]));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn autonomous_watchdog_emits_runtime_exception_and_recovers() {
+        let mut rt = setup_runtime("<html><body></body></html>");
+        rt.set_runtime_events_enabled(true);
+        rt.evaluate("(() => { setTimeout(() => { while (true) {} }, 0); return true; })()").unwrap();
+        let error = rt.run_autonomous_event_loop_turn().await.unwrap_err();
+        assert!(error.contains("task budget"), "{error}");
+        let exceptions: Vec<_> = rt.take_pending_runtime_events().into_iter()
+            .filter_map(|event| match event { RuntimeEvent::Exception(error) => Some(error), _ => None })
+            .collect();
+        assert_eq!(exceptions.len(), 1);
+        assert_eq!(exceptions[0].name, "ObscuraTaskError");
+        assert!(exceptions[0].description.contains(&error));
+        assert!(!exceptions[0].url.is_empty());
+        assert!(exceptions[0].timestamp > 0.0);
+        assert_eq!(rt.evaluate("1 + 1").unwrap().as_f64(), Some(2.0));
     }
 
     #[tokio::test]

@@ -3204,7 +3204,6 @@ pub(crate) fn record_uncaught_exception(
     if !state.runtime_events_enabled {
         return;
     }
-    state.runtime_exception_counter = state.runtime_exception_counter.saturating_add(1);
     let first = error.frames.first();
     let url = first
         .and_then(|frame| frame.file_name.clone())
@@ -3221,23 +3220,40 @@ pub(crate) fn record_uncaught_exception(
             "columnNumber": frame.column_number.unwrap_or(1).saturating_sub(1),
         })
     }).collect();
-    let timestamp = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_secs_f64() * 1_000.0;
-    if state.pending_runtime_events.len() >= 1_024 {
-        state.pending_runtime_events.pop_front();
-    }
-    state.pending_runtime_events.push_back(RuntimeEvent::Exception(RuntimeExceptionEvent {
-        exception_id: state.runtime_exception_counter,
+    enqueue_runtime_exception(state, RuntimeExceptionEvent {
+        exception_id: 0,
         name: error.name.clone().unwrap_or_else(|| "Error".to_string()),
         description: error.stack.clone().unwrap_or_else(|| error.exception_message.clone()),
         url,
         line_number,
         column_number,
         stack_trace,
-        timestamp,
-    }));
+        timestamp: 0.0,
+    });
+}
+
+// Runtime-native failures (including watchdog termination) must use the same
+// observable, bounded queue as JavaScript exceptions. Stderr alone is not a
+// runtime-error receipt for CDP clients such as WebPilot.
+pub(crate) fn record_autonomous_task_failure(state: &mut ObscuraState, message: &str) {
+    let url = state.url.clone();
+    enqueue_runtime_exception(state, RuntimeExceptionEvent {
+        exception_id: 0, name: "ObscuraTaskError".into(),
+        description: format!("ObscuraTaskError: {message}"), url,
+        line_number: 0, column_number: 0, stack_trace: Vec::new(), timestamp: 0.0,
+    });
+}
+
+fn enqueue_runtime_exception(state: &mut ObscuraState, mut event: RuntimeExceptionEvent) {
+    if !state.runtime_events_enabled { return; }
+    state.runtime_exception_counter = state.runtime_exception_counter.saturating_add(1);
+    event.exception_id = state.runtime_exception_counter;
+    event.timestamp = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default().as_secs_f64() * 1_000.0;
+    if state.pending_runtime_events.len() >= 1_024 {
+        state.pending_runtime_events.pop_front();
+    }
+    state.pending_runtime_events.push_back(RuntimeEvent::Exception(event));
 }
 
 #[op2(nofast)]
