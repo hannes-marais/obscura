@@ -509,7 +509,10 @@ fn serialize_node(dom: &DomTree, node_id: NodeId, max_depth: u32, current_depth:
                 // This node's children are all built; finalize and fold into parent.
                 let mut frame = stack.pop().unwrap();
                 if !frame.built.is_empty() {
-                    frame.value["children"] = json!(frame.built);
+                    // These children are already JSON Values. Move the array:
+                    // json! serializes and clones the whole completed subtree
+                    // again at every ancestor (hot in large CDP snapshots).
+                    frame.value["children"] = Value::Array(frame.built);
                 }
                 match stack.last_mut() {
                     Some(parent) => parent.built.push(frame.value),
