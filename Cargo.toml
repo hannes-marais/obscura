@@ -69,6 +69,16 @@ cosmic-text = { path = "vendor/cosmic-text" }
 # their bodies in std::panic::catch_unwind so a panic degrades to an error return
 # instead of unwinding into V8's FFI frame and aborting the process. panic="abort"
 # would turn every catchable op panic into a hard crash.
+# Debug factory tools still capture every WebPilot screenshot. Unoptimized
+# SIMD raster dependencies dominated live screenshot CPU (vm-iocb, 2026-10-23).
+# Keep application code/symbols/assertions in Debug; optimize just these stable
+# dependency loops so a fast compile does not make every test capture slow.
+[profile.dev.package.tiny-skia]
+opt-level = 3
+
+[profile.dev.package.tiny-skia-path]
+opt-level = 3
+
 [profile.release]
 panic = "unwind"
 
