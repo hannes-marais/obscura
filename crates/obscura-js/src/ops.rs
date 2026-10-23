@@ -1128,6 +1128,13 @@ struct FrameTimers {
 }
 
 impl RealmStates {
+    // The upstream IndexedDB notification dispatcher shares this realm
+    // enumeration helper with media emulation. Retain it when integrating
+    // storage independently of the media-emulation changes.
+    pub(crate) fn media_realms(&self) -> Vec<(v8::Global<v8::Context>, SharedState)> {
+        self.entries.iter().map(|(context, _, state)| (context.clone(), state.clone())).collect()
+    }
+
     pub(crate) fn live_count(&self) -> usize {
         self.entries.len()
     }
