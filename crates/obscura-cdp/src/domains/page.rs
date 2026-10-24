@@ -1027,7 +1027,7 @@ pub fn emit_navigation_events(
         });
         ctx.pending_events.push(CdpEvent {
             method: "Network.loadingFinished".into(),
-            params: json!({"requestId": rid, "timestamp": net_event.timestamp, "encodedDataLength": net_event.body_size}),
+            params: json!({"requestId": rid, "timestamp": net_event.timestamp, "encodedDataLength": net_event.encoded_data_length.unwrap_or(net_event.body_size)}),
             session_id: es.clone(),
         });
     }
@@ -1234,7 +1234,7 @@ pub(crate) fn emit_runtime_network_events(
             params: json!({
                 "requestId": request_id,
                 "timestamp": network_event.timestamp,
-                "encodedDataLength": network_event.body_size,
+                "encodedDataLength": network_event.encoded_data_length.unwrap_or(network_event.body_size),
             }),
             session_id: session_id.clone(),
         });
@@ -1953,7 +1953,7 @@ mod tests {
             .into_iter().map(|(id, kind, url, status)| obscura_browser::NetworkEvent {
                 request_id: id.into(), intercepted: false, url: url.into(), method: "GET".into(),
                 resource_type: kind.into(), status, headers: Default::default(),
-                response_headers: std::sync::Arc::new(Default::default()), body_size: 12, timestamp: 42.0,
+                response_headers: std::sync::Arc::new(Default::default()), body_size: 12, encoded_data_length: None, timestamp: 42.0,
                 error_text: None,
             }).collect();
         (ctx, page, driver, events)
@@ -2242,7 +2242,7 @@ mod tests {
                 "content-type".into(),
                 "application/json".into(),
             )])),
-            body_size: 12,
+            body_size: 12, encoded_data_length: None,
             timestamp: 42.0,
             error_text: None,
         };
@@ -2335,7 +2335,7 @@ mod tests {
             status: 200,
             headers: std::collections::HashMap::new(),
             response_headers: std::sync::Arc::new(std::collections::HashMap::new()),
-            body_size: 0,
+            body_size: 0, encoded_data_length: None,
             timestamp: 42.0,
             error_text: None,
         };

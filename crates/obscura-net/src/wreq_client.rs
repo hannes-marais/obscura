@@ -332,7 +332,7 @@ impl StealthHttpClient {
                 url: current_url,
                 headers: HashMap::new(),
                 body: Vec::new(),
-                redirected_from: Vec::new(),
+                redirected_from: Vec::new(), transport: None,
             });
         }
 
@@ -464,7 +464,7 @@ impl StealthHttpClient {
                 status: status.as_u16(),
                 headers: response_headers,
                 body,
-                redirected_from: redirects,
+                redirected_from: redirects, transport: None,
             };
             if let Some(callbacks) = callbacks {
                 callbacks.fire_response(&request_info, &response).await;
@@ -514,7 +514,7 @@ impl StealthHttpClient {
         ).await?;
         Ok(Response {
             url: url.clone(), status: response.status, headers: response.headers,
-            body: response.body.await?, redirected_from: Vec::new(),
+            body: response.body.await?, redirected_from: Vec::new(), transport: None,
         })
     }
 

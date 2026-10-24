@@ -79,15 +79,34 @@ pub(crate) fn custom_cert_store_requested(
 }
 
 #[derive(Debug, Clone)]
+pub struct TransportMetrics {
+    pub encoded_body_size: Option<usize>,
+    pub response_start: std::time::Instant,
+    pub response_end: std::time::Instant,
+    pub from_cache: bool,
+    pub timing_allowed: bool,
+}
+
+#[derive(Debug, Clone)]
 pub struct Response {
     pub url: Url,
     pub status: u16,
     pub headers: HashMap<String, String>,
     pub body: Vec<u8>,
     pub redirected_from: Vec<Url>,
+    pub transport: Option<TransportMetrics>,
 }
 
 impl Response {
+    fn reused(mut self) -> Self {
+        if let Some(metrics) = &mut self.transport {
+            metrics.from_cache = true;
+            // A logical cache hit must not replay another request's clock.
+            metrics.response_start = std::time::Instant::now();
+            metrics.response_end = metrics.response_start;
+        }
+        self
+    }
     /// Decode the body as text, honoring the response charset.
     ///
     /// Uses the HTTP `Content-Type` header's `charset=` parameter, then for
@@ -738,7 +757,7 @@ pub(crate) async fn fetch_file_url(
         status: 200,
         headers,
         body,
-        redirected_from: Vec::new(),
+        redirected_from: Vec::new(), transport: None,
     })
 }
 
@@ -1320,6 +1339,7 @@ impl ObscuraHttpClient {
 
         match acquisition {
             Acquisition::Cached(response) => {
+                let response = response.reused();
                 self.fire_logical_resource_callbacks(callbacks, url, &request, &response)
                     .await;
                 Ok(response)
@@ -1329,6 +1349,7 @@ impl ObscuraHttpClient {
                 if let Some(outcome) = outcome {
                     break match outcome {
                         SharedFetchOutcome::Cacheable(response) => {
+                            let response = response.reused();
                             self.fire_logical_resource_callbacks(
                                 callbacks, url, &request, &response,
                             )
@@ -1447,7 +1468,7 @@ impl ObscuraHttpClient {
                         url: url.clone(),
                         headers: HashMap::new(),
                         body: Vec::new(),
-                        redirected_from: Vec::new(),
+                        redirected_from: Vec::new(), transport: None,
                     });
                 }
             }
@@ -1455,6 +1476,7 @@ impl ObscuraHttpClient {
 
         let mut current_url = url.clone();
         let mut redirects = Vec::new();
+        let mut timing_allowed = true;
         // Follow up to 20 redirects, matching the Fetch spec and the fetch()/XHR
         // path in obscura-js. `0..=max_redirects` makes max_redirects+1 requests
         // (the initial one plus 20 hops), so the 20th redirect is still followed
@@ -1635,6 +1657,7 @@ impl ObscuraHttpClient {
             })?;
 
             let status = resp.status();
+            let response_start = std::time::Instant::now();
             validate_reqwest_cors_response(
                 &request,
                 &current_url,
@@ -1657,6 +1680,13 @@ impl ObscuraHttpClient {
                     k.as_str().to_lowercase(),
                     v.to_str().unwrap_or("").to_string(),
                 );
+            }
+
+            if let Some(initiator) = &request.initiator {
+                let origin = initiator.origin().ascii_serialization();
+                timing_allowed &= current_url.origin() == initiator.origin() ||
+                    response_headers.get("timing-allow-origin").is_some_and(|value|
+                        value.split(',').map(str::trim).any(|value| value == "*" || value == origin));
             }
 
             if status.is_redirection() {
@@ -1684,7 +1714,7 @@ impl ObscuraHttpClient {
                 }
             }
 
-            let body_bytes = read_reqwest_body_limited(
+            let (body_bytes, encoded_body_size) = read_reqwest_body_limited_with_size(
                 resp,
                 &current_url,
                 request.max_response_bytes,
@@ -1698,6 +1728,10 @@ impl ObscuraHttpClient {
                 headers: response_headers,
                 body: body_bytes,
                 redirected_from: redirects,
+                transport: Some(TransportMetrics {
+                    encoded_body_size: Some(encoded_body_size), response_start,
+                    response_end: std::time::Instant::now(), from_cache: false, timing_allowed,
+                }),
             };
 
             if let Some(cbs) = callbacks {
@@ -2658,6 +2692,16 @@ mod ssrf_tests {
 
         assert_eq!(responses.len(), 16);
         assert!(responses.iter().all(|response| response.status == 200));
+        assert_eq!(network_requests.load(Ordering::SeqCst), 1);
+        assert_eq!(responses.iter().filter(|response|
+            !response.transport.as_ref().unwrap().from_cache).count(), 1);
+        let physical_bytes: usize = responses.iter().filter_map(|response|
+            response.transport.as_ref().filter(|metrics| !metrics.from_cache)
+                .and_then(|metrics| metrics.encoded_body_size)).sum();
+        assert_eq!(physical_bytes, responses[0].body.len());
+        let cached = client.fetch_resource_with_callbacks(&url,
+            ResourceRequest::module_script(&initiator, &initiator), None).await.unwrap();
+        assert!(cached.transport.as_ref().unwrap().from_cache);
         assert_eq!(network_requests.load(Ordering::SeqCst), 1);
     }
 

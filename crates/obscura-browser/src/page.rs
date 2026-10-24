@@ -185,6 +185,7 @@ pub struct NetworkEvent {
     pub headers: std::collections::HashMap<String, String>,
     pub response_headers: Arc<std::collections::HashMap<String, String>>,
     pub body_size: usize,
+    pub encoded_data_length: Option<usize>,
     pub timestamp: f64,
     pub error_text: Option<String>,
 }
@@ -2441,7 +2442,7 @@ impl Page {
                             status: 200,
                             headers,
                             body,
-                            redirected_from: Vec::new(),
+                            redirected_from: Vec::new(), transport: None,
                         };
                         return Some((idx, url, resp));
                     }
@@ -2842,14 +2843,6 @@ impl Page {
                             tracing::warn!("ES module evaluation error: {}", error);
                         } else if let Some(url) = url {
                             tracing::info!("ES module loaded: {}", url);
-                            self.record_network_event(
-                                &url,
-                                "GET",
-                                "Script",
-                                200,
-                                &std::collections::HashMap::new(),
-                                0,
-                            );
                         }
                     } else {
                         post_parse.push(scheduled);
@@ -2930,14 +2923,6 @@ impl Page {
                         tracing::warn!("ES module evaluation error: {}", error);
                     } else if let Some(url) = url {
                         tracing::info!("ES module loaded: {}", url);
-                        self.record_network_event(
-                            &url,
-                            "GET",
-                            "Script",
-                            200,
-                            &std::collections::HashMap::new(),
-                            0,
-                        );
                     }
                 }
             }
@@ -3468,7 +3453,7 @@ impl Page {
                 status: 200,
                 headers,
                 body: body_bytes,
-                redirected_from: Vec::new(),
+                redirected_from: Vec::new(), transport: None,
             })
         } else if method == "POST" {
             self.http_client
@@ -4294,6 +4279,7 @@ impl Page {
                 headers: std::collections::HashMap::new(),
                 response_headers: Arc::new(ev.response_headers),
                 body_size: ev.body_size,
+                encoded_data_length: ev.encoded_data_length,
                 timestamp: ev.timestamp,
                 error_text: ev.error_text,
             });
@@ -4597,6 +4583,7 @@ impl Page {
             headers: std::collections::HashMap::new(),
             response_headers: Arc::new(response_headers.clone()),
             body_size,
+            encoded_data_length: None,
             timestamp,
             error_text: None,
         });

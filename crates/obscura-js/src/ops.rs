@@ -93,6 +93,7 @@ pub struct JsNetworkEvent {
     pub status: u16,
     pub response_headers: HashMap<String, String>,
     pub body_size: usize,
+    pub encoded_data_length: Option<usize>,
     pub timestamp: f64,
     pub error_text: Option<String>,
 }
@@ -107,6 +108,7 @@ struct ResourceTiming {
     encoded_body_size: Option<usize>,
     timing_allowed: bool,
     status_allowed: bool,
+    from_cache: bool,
 }
 
 #[cfg(feature = "render")]
@@ -150,6 +152,7 @@ impl Default for NavigationTiming {
 }
 
 impl NavigationTiming {
+    pub(crate) fn monotonic_origin(&self) -> std::time::Instant { self.origin }
     pub fn record(&mut self, name: &str) {
         if let Some(index) = NAVIGATION_TIMING_FIELDS.iter().position(|field| *field == name) {
             // document.open/close and synthetic events must not replace the
@@ -894,8 +897,9 @@ fn record_js_network_completion(
     push_js_network_event(&mut gs, event);
 }
 
-fn push_js_network_event(gs: &mut ObscuraState, event: JsNetworkEvent) {
+fn push_js_network_event(gs: &mut ObscuraState, mut event: JsNetworkEvent) {
     if let Some(timing) = gs.resource_timing_pending.remove(&event.request_id) {
+        if event.encoded_data_length.is_none() { event.encoded_data_length = timing.encoded_body_size; }
         let end = timing.response_end.unwrap_or_else(||
             gs.navigation_timing.origin.elapsed().as_secs_f64() * 1_000.0);
         let allowed = timing.timing_allowed && timing.response_start > 0.0 && event.error_text.is_none();
@@ -911,7 +915,7 @@ fn push_js_network_event(gs: &mut ObscuraState, event: JsNetworkEvent) {
             "encodedBodySize": encoded, "decodedBodySize": decoded,
             // Resource Timing standardizes the HTTP header overhead as300.
             // Unknown encoded transfer size (e.g. an opaque transport) stays0.
-            "transferSize": if allowed { timing.encoded_body_size.map(|size| size + 300).unwrap_or(0) } else { 0 },
+            "transferSize": if allowed && !timing.from_cache { timing.encoded_body_size.map(|size| size + 300).unwrap_or(0) } else { 0 },
         }));
     }
     gs.js_network_events.push(event);
@@ -920,6 +924,52 @@ fn push_js_network_event(gs: &mut ObscuraState, event: JsNetworkEvent) {
         let overflow = gs.js_network_events.len() - MAX_JS_NETWORK_EVENTS;
         gs.js_network_events.drain(0..overflow);
     }
+}
+
+pub(crate) fn record_module_completion(
+    gs: &mut ObscuraState, document_url: &str, navigation_origin: std::time::Instant,
+    started: std::time::Instant, requested_url: &str, response: Option<&Response>, error: Option<String>,
+) {
+    // A completion from a replaced document must not populate the new realm.
+    if gs.navigation_timing.origin != navigation_origin || gs.url != document_url { return; }
+    static MODULE_REQUEST: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+    let request_id = format!("module-{}", MODULE_REQUEST.fetch_add(1, std::sync::atomic::Ordering::Relaxed));
+    let millis = |at: std::time::Instant| at.saturating_duration_since(navigation_origin).as_secs_f64() * 1_000.0;
+    let metrics = response.and_then(|response| response.transport.as_ref());
+    let from_cache = metrics.is_some_and(|metrics| metrics.from_cache);
+    gs.resource_timing_pending.insert(request_id.clone(), ResourceTiming {
+        name: requested_url.into(), initiator_type: "script".into(),
+        origin: request_origin(document_url).unwrap_or_default(), start_time: millis(started),
+        response_start: metrics.map(|metrics| millis(metrics.response_start)).unwrap_or(0.0),
+        response_end: Some(millis(metrics.map(|metrics| metrics.response_end).unwrap_or_else(std::time::Instant::now))),
+        encoded_body_size: metrics.and_then(|metrics| metrics.encoded_body_size),
+        timing_allowed: metrics.is_some_and(|metrics| metrics.timing_allowed),
+        status_allowed: response.is_some(), from_cache,
+    });
+    let body_size = response.map(|response| response.body.len()).unwrap_or(0);
+    if body_size <= response_body_byte_limit() && response_body_entry_limit() > 0 {
+        if let Some(response) = response {
+            gs.network_response_bodies.insert(request_id.clone(), StoredNetworkResponseBody {
+                body: String::from_utf8_lossy(&response.body).into_owned(), base64_encoded: false,
+            });
+            gs.network_response_body_order.push_back(request_id.clone());
+            while gs.network_response_body_order.len() > response_body_entry_limit() {
+                if let Some(oldest) = gs.network_response_body_order.pop_front() { gs.network_response_bodies.remove(&oldest); }
+            }
+        }
+    }
+    push_js_network_event(gs, JsNetworkEvent {
+        request_id, intercepted: false,
+        url: response.map(|response| response.url.as_str()).unwrap_or(requested_url).into(),
+        method: "GET".into(), resource_type: "Script".into(),
+        status: response.map(|response| response.status).unwrap_or(0),
+        response_headers: response.map(|response| response.headers.clone()).unwrap_or_default(),
+        body_size,
+        // Unknown and cached physical transfers are zero, never decoded bytes.
+        encoded_data_length: Some(if from_cache { 0 } else { metrics.and_then(|metrics| metrics.encoded_body_size).unwrap_or(0) }),
+        timestamp: std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_secs_f64(),
+        error_text: error,
+    });
 }
 
 fn resource_response(
@@ -3921,7 +3971,7 @@ async fn fetch_url_inner(
             request_id: request_id.clone(), intercepted: false,
             url: url.clone(), method: method.clone(), status: 0,
             resource_type: resource_type_name.to_string(),
-            response_headers: HashMap::new(), body_size: 0, timestamp: 0.0, error_text: None,
+            response_headers: HashMap::new(), body_size: 0, encoded_data_length: None, timestamp: 0.0, error_text: None,
         }),
         cancel: cancel.clone(),
     };
@@ -3936,7 +3986,7 @@ async fn fetch_url_inner(
                 "Document" => "iframe", _ => "fetch",
             }.into(),
             origin: origin.clone(), start_time, response_start: 0.0, response_end: None,
-            encoded_body_size: None, timing_allowed: true, status_allowed: false,
+            encoded_body_size: None, timing_allowed: true, status_allowed: false, from_cache: false,
         });
     }
     let credentials = FetchCredentials::parse(&credentials);
@@ -3989,7 +4039,7 @@ async fn fetch_url_inner(
                         error_text: None,
                         url: url.clone(), method: method.clone(), status,
                         resource_type: resource_type_name.to_string(),
-                        response_headers: h.clone(), body_size,
+                        response_headers: h.clone(), body_size, encoded_data_length: None,
                         timestamp: std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)
                             .unwrap_or_default().as_secs_f64(),
                     }, if encoded { &bb } else { &b }, encoded);
@@ -4528,7 +4578,7 @@ async fn fetch_url_inner(
                 error_text: None,
                 url: current_url, method: current_method.as_str().to_string(), status,
                 resource_type: resource_type_name.to_string(),
-                response_headers: resp_headers, body_size: resp_bytes.len(),
+                response_headers: resp_headers, body_size: resp_bytes.len(), encoded_data_length: None,
                 timestamp: std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)
                     .unwrap_or_default().as_secs_f64(),
             }, &String::from_utf8_lossy(&resp_bytes), false);
@@ -4556,6 +4606,7 @@ fn fetch_response(
         headers,
         body,
         redirected_from,
+        transport: None,
     }
 }
 
@@ -9002,4 +9053,32 @@ fn op_scroll_to(state: &OpState, x: f64, y: f64, frame_id: u32) -> String {
     sample_live_document_animations(&mut gs);
     let (x, y) = clamp_scroll_offset_for_geometry(&mut gs, (x as f32, y as f32));
     format!("{{\"x\":{},\"y\":{}}}", x, y)
+}
+
+#[cfg(test)]
+mod module_timing_tests {
+    use super::*;
+
+    #[test]
+    fn module_completion_cannot_cross_document_or_navigation_boundary() {
+        let mut state = ObscuraState::new();
+        state.url = "https://old.test/page".into();
+        let origin = state.navigation_timing.monotonic_origin();
+        state.url = "https://new.test/page".into();
+        record_module_completion(&mut state, "https://old.test/page", origin, origin,
+            "https://old.test/module.js", None, Some("cancelled".into()));
+        assert!(state.js_network_events.is_empty());
+        state.url = "https://old.test/page".into();
+        state.navigation_timing = NavigationTiming::default();
+        record_module_completion(&mut state, "https://old.test/page", origin, origin,
+            "https://old.test/module.js", None, Some("cancelled".into()));
+        assert!(state.js_network_events.is_empty());
+        let current = state.navigation_timing.monotonic_origin();
+        record_module_completion(&mut state, "https://old.test/page", current, current,
+            "https://old.test/module.js", None, Some("cancelled".into()));
+        assert_eq!(state.js_network_events.len(), 1);
+        assert_eq!(state.js_network_events[0].status, 0);
+        assert_eq!(state.js_network_events[0].error_text.as_deref(), Some("cancelled"));
+        assert_eq!(state.resource_timing_entries[0]["transferSize"], serde_json::json!(0));
+    }
 }

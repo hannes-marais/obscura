@@ -245,3 +245,99 @@ async fn resource_timing_internal_failed_script_notifies_observer_without_a_time
     finish(&mut rt).await;
     assert_eq!(rt.evaluate("observed").unwrap(), json!([["script", 0]]));
 }
+
+#[tokio::test(flavor = "current_thread")]
+async fn resource_timing_module_uses_wire_bytes_and_real_header_body_boundaries() {
+    let wire: Vec<u8> = "1f8b08000000000002ffedc6b10980301040d1de29d2a533038833d8b840e21d2a9c9c1814dd5ee790ffaa379b976ce3b2d67673394d8752f5b854421fa2e8e4f275cf8f7996d83529dd0000000000e0f75e81f2db6a31100000".as_bytes().chunks_exact(2)
+        .map(|pair| u8::from_str_radix(std::str::from_utf8(pair).unwrap(), 16).unwrap()).collect();
+    let wire_size = wire.len();
+    let base = fixture(vec![
+        (200, "Content-Type: application/javascript\r\n", b"import './child.js';".to_vec()),
+        (200, "Content-Type: application/javascript\r\nContent-Encoding: gzip\r\n", wire),
+    ]).await;
+    let mut rt = ObscuraJsRuntime::with_base_url(&format!("{base}/page"));
+    rt.set_url(&format!("{base}/page"));
+    rt.set_dom(obscura_dom::parse_html("<html><body></body></html>"));
+    rt.set_http_client(Arc::new(obscura_net::ObscuraHttpClient::with_full_options(
+        Arc::new(obscura_net::CookieJar::new()), None, true,
+    )));
+    rt.run_page_init();
+    rt.load_module(&format!("{base}/entry.js"), 4000).await.unwrap();
+    assert_eq!(rt.evaluate("moduleObserved").unwrap(), json!("decoded payload"));
+    let entries = rt.evaluate("performance.getEntriesByType('resource').map(e => e.toJSON())").unwrap();
+    let entry = entries.as_array().unwrap().iter().find(|entry| entry["name"].as_str().unwrap().ends_with("/child.js")).unwrap();
+    assert_eq!(entries.as_array().unwrap().len(), 2);
+    assert_eq!(entry["initiatorType"], json!("script"));
+    assert_eq!(entry["encodedBodySize"], json!(wire_size));
+    assert_eq!(entry["decodedBodySize"], json!(4145));
+    assert_eq!(entry["transferSize"], json!(wire_size + 300));
+    assert!(entry["responseEnd"].as_f64().unwrap() > entry["responseStart"].as_f64().unwrap());
+    let events = rt.take_js_network_events();
+    assert_eq!(events.len(), 2);
+    let child = events.iter().find(|event| event.url.ends_with("/child.js")).unwrap();
+    assert_eq!(child.encoded_data_length, Some(wire_size));
+    assert_eq!(child.body_size, 4145);
+    assert_eq!(child.response_headers.get("content-encoding").map(String::as_str), Some("gzip"));
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn resource_timing_module_http_failure_keeps_actual_status() {
+    let base = fixture(vec![(404, "Content-Type: application/javascript\r\n", b"missing module".to_vec())]).await;
+    let mut rt = ObscuraJsRuntime::with_base_url(&format!("{base}/page"));
+    rt.set_url(&format!("{base}/page"));
+    rt.set_http_client(Arc::new(obscura_net::ObscuraHttpClient::with_full_options(
+        Arc::new(obscura_net::CookieJar::new()), None, true,
+    )));
+    rt.run_page_init();
+    assert!(rt.load_module(&format!("{base}/missing.js"), 4000).await.unwrap_err().contains("404"));
+    let events = rt.take_js_network_events();
+    assert_eq!(events.len(), 1);
+    assert_eq!(events[0].status, 404);
+    assert_eq!(events[0].encoded_data_length, Some(14));
+    assert_eq!(rt.evaluate("performance.getEntriesByType('resource')[0].responseStatus").unwrap(), json!(404.0));
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn resource_timing_modules_enforce_timing_allow_origin() {
+    let code = b"export const value = 1;".to_vec();
+    let size = code.len();
+    let base = fixture(vec![
+        (200, "Content-Type: application/javascript\r\nAccess-Control-Allow-Origin: *\r\n", code.clone()),
+        (200, "Content-Type: application/javascript\r\nAccess-Control-Allow-Origin: *\r\nTiming-Allow-Origin: *\r\n", code),
+    ]).await;
+    let mut rt = ObscuraJsRuntime::with_base_url("https://document.test/page");
+    rt.set_url("https://document.test/page");
+    rt.set_http_client(Arc::new(obscura_net::ObscuraHttpClient::with_full_options(
+        Arc::new(obscura_net::CookieJar::new()), None, true,
+    )));
+    rt.run_page_init();
+    rt.load_module(&format!("{base}/hidden.js"), 4000).await.unwrap();
+    rt.load_module(&format!("{base}/allowed.js"), 4000).await.unwrap();
+    assert_eq!(rt.evaluate("performance.getEntriesByType('resource').map(e => [e.encodedBodySize, e.decodedBodySize, e.transferSize, e.responseStart > 0])").unwrap(),
+        json!([[0, 0, 0, false], [size, size, size + 300, true]]));
+    let events = rt.take_js_network_events();
+    assert_eq!(events.len(), 2);
+    assert!(events.iter().all(|event| event.encoded_data_length == Some(size)));
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn resource_timing_modules_require_tao_across_every_redirect_hop() {
+    let code = b"export const redirected = true;".to_vec();
+    let size = code.len();
+    let base = fixture(vec![
+        (302, "Access-Control-Allow-Origin: *\r\nLocation: /first-final.js\r\n", vec![]),
+        (200, "Content-Type: application/javascript\r\nAccess-Control-Allow-Origin: *\r\nTiming-Allow-Origin: *\r\n", code.clone()),
+        (302, "Access-Control-Allow-Origin: *\r\nTiming-Allow-Origin: *\r\nLocation: /second-final.js\r\n", vec![]),
+        (200, "Content-Type: application/javascript\r\nAccess-Control-Allow-Origin: *\r\nTiming-Allow-Origin: *\r\n", code),
+    ]).await;
+    let mut rt = ObscuraJsRuntime::with_base_url("https://document.test/page");
+    rt.set_url("https://document.test/page");
+    rt.set_http_client(Arc::new(obscura_net::ObscuraHttpClient::with_full_options(
+        Arc::new(obscura_net::CookieJar::new()), None, true,
+    )));
+    rt.run_page_init();
+    rt.load_module(&format!("{base}/hidden-redirect.js"), 4000).await.unwrap();
+    rt.load_module(&format!("{base}/allowed-redirect.js"), 4000).await.unwrap();
+    assert_eq!(rt.evaluate("performance.getEntriesByType('resource').map(e => [e.encodedBodySize, e.transferSize])").unwrap(),
+        json!([[0, 0], [size, size + 300]]));
+}

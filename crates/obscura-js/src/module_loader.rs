@@ -54,6 +54,34 @@ impl ModuleLoadActivity {
 
 struct ModuleLoadGuard(Arc<ModuleLoadActivity>);
 
+struct ModuleTransferGuard {
+    state: Option<Weak<RefCell<ObscuraState>>>,
+    origin: Option<std::time::Instant>,
+    started: std::time::Instant,
+    document_url: String,
+    requested_url: String,
+    finished: bool,
+}
+
+impl ModuleTransferGuard {
+    fn finish(&mut self, response: Option<&obscura_net::Response>, error: Option<String>) {
+        self.finished = true;
+        if let (Some(state), Some(origin)) = (self.state.as_ref().and_then(Weak::upgrade), self.origin) {
+            match state.try_borrow_mut() {
+                Ok(mut state) => crate::ops::record_module_completion(&mut state, &self.document_url,
+                    origin, self.started, &self.requested_url, response, error),
+                Err(error) => tracing::warn!(%error, "Cannot record module completion: page state is borrowed"),
+            }
+        }
+    }
+}
+
+impl Drop for ModuleTransferGuard {
+    fn drop(&mut self) {
+        if !self.finished { self.finish(None, Some("Module fetch cancelled".into())); }
+    }
+}
+
 impl Drop for ModuleLoadGuard {
     fn drop(&mut self) {
         let previous = self
@@ -237,7 +265,7 @@ impl ModuleLoader for ObscuraModuleLoader {
                 let stealth = state.stealth_client.clone();
                 #[cfg(not(feature = "stealth"))]
                 let stealth: Option<std::sync::Arc<()>> = None;
-                Ok((client, stealth, state.callbacks.clone()))
+                Ok((client, stealth, state.callbacks.clone(), Some(state.navigation_timing.monotonic_origin())))
             })(),
             None => self
                 .standalone_client
@@ -247,11 +275,12 @@ impl ModuleLoader for ObscuraModuleLoader {
                     let stealth = None;
                     #[cfg(not(feature = "stealth"))]
                     let stealth: Option<std::sync::Arc<()>> = None;
-                    (client, stealth, None)
+                    (client, stealth, None, None)
                 })
                 .ok_or_else(|| "No network context wired to module loader".to_string()),
         };
 
+        let page_state = self.page_state.clone();
         ModuleLoadResponse::Async(Pin::from(Box::new(async move {
             // deno_core propagates `is_dynamic_import` to every dependency edge in
             // the recursive graph, so this excludes parser-discovered/static
@@ -264,11 +293,15 @@ impl ModuleLoader for ObscuraModuleLoader {
             );
 
             match page_network {
-                Ok((client, stealth, callbacks)) => {
+                Ok((client, stealth, callbacks, origin)) => {
                     let requested = ModuleSpecifier::parse(&url)
                         .map_err(|e| io_err(format!("Invalid module URL {}: {}", url, e)))?;
                     let request =
                         obscura_net::ResourceRequest::module_script(&document_url, &referrer);
+                    let mut transfer = ModuleTransferGuard {
+                        state: page_state, origin, started: std::time::Instant::now(),
+                        document_url: document_url.to_string(), requested_url: url.clone(), finished: false,
+                    };
                     #[cfg(feature = "stealth")]
                     let resp = match stealth {
                         Some(stealth) => stealth
@@ -287,8 +320,7 @@ impl ModuleLoader for ObscuraModuleLoader {
                                 )
                                 .await
                         }
-                    }
-                    .map_err(|e| io_err(format!("Failed to fetch module {}: {}", url, e)))?;
+                    };
                     #[cfg(not(feature = "stealth"))]
                     let resp = {
                         let _ = &stealth;
@@ -299,7 +331,13 @@ impl ModuleLoader for ObscuraModuleLoader {
                                 callbacks.as_deref(),
                             )
                             .await
-                            .map_err(|e| io_err(format!("Failed to fetch module {}: {}", url, e)))?
+                    };
+                    let resp = match resp {
+                        Ok(response) => { transfer.finish(Some(&response), None); response }
+                        Err(error) => {
+                            transfer.finish(None, Some(error.to_string()));
+                            return Err(io_err(format!("Failed to fetch module {}: {}", url, error)));
+                        }
                     };
                     if !(200..=299).contains(&resp.status) {
                         return Err(io_err(format!(
