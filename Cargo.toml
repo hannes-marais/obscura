@@ -79,6 +79,12 @@ opt-level = 3
 [profile.dev.package.tiny-skia-path]
 opt-level = 3
 
+# WebPilot captures every step. Live v214 profiles put most screenshot CPU
+# in image resize loops; leave application code Debug without making native
+# image work consume browser task deadlines (vm-iocb, 2026-10-24).
+[profile.dev.package.image]
+opt-level = 3
+
 [profile.release]
 panic = "unwind"
 
