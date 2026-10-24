@@ -85,6 +85,12 @@ opt-level = 3
 [profile.dev.package.image]
 opt-level = 3
 
+# Generic image/paint loops are instantiated in the renderer crate. Optimizing
+# image alone leaves those call sites slow; retain Debug symbols/assertions
+# while optimizing the measured rendering library, not the whole workspace.
+[profile.dev.package.obscura-render]
+opt-level = 3
+
 [profile.release]
 panic = "unwind"
 
