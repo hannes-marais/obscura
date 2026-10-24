@@ -103,6 +103,16 @@ opt-level = 3
 [profile.dev.package.obscura-dom]
 opt-level = 3
 
+# The live v214 keyboard-feedback comparison passes in Release but exceeds
+# 500 ms in Debug. Samples retain JSON/DOM bridge serialization in this crate
+# after optimizing the DOM itself. Cache the bridge and JSON dependency with
+# optimization while retaining Debug assertions/symbols and the Debug channel.
+[profile.dev.package.obscura-js]
+opt-level = 3
+
+[profile.dev.package.serde_json]
+opt-level = 3
+
 [profile.release]
 panic = "unwind"
 
