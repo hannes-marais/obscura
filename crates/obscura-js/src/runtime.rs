@@ -22403,6 +22403,23 @@ mod tests {
     }
 
     #[test]
+    fn test_xml_serializer_preserves_source_and_escapes_script_text() {
+        let mut rt = setup_runtime("<html><body></body></html>");
+        let result = rt.evaluate(r#"(() => {
+            const xml = '<blocks><lesson><source>real &amp; complete &lt;lesson&gt;</source><input>data</input><script>if (a &lt; b) a++;</script></lesson></blocks>';
+            const doc = new DOMParser().parseFromString(xml, 'application/xml');
+            const serialized = new XMLSerializer().serializeToString(doc);
+            const again = new DOMParser().parseFromString(serialized, 'application/xml');
+            return [serialized, again.querySelector('source').textContent,
+                again.querySelector('input').textContent, again.querySelector('script').textContent];
+        })()"#).unwrap();
+        assert_eq!(result, serde_json::json!([
+            "<blocks><lesson><source>real &amp; complete &lt;lesson&gt;</source><input>data</input><script>if (a &lt; b) a++;</script></lesson></blocks>",
+            "real & complete <lesson>", "data", "if (a < b) a++;"
+        ]));
+    }
+
+    #[test]
     fn test_xml_serializer_element() {
         let mut rt = setup_runtime(r#"<html><body><div id="x">Hello</div></body></html>"#);
         let result = rt

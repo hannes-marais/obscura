@@ -15,13 +15,21 @@ enum SerializeWork {
 impl DomTree {
     pub fn outer_html(&self, node_id: NodeId) -> String {
         let mut buf = String::new();
-        self.serialize_worklist(vec![SerializeWork::Node(node_id, true)], &mut buf);
+        self.serialize_worklist(vec![SerializeWork::Node(node_id, true)], &mut buf, false);
+        buf
+    }
+
+    /// XMLSerializer must preserve children of names such as source/input and
+    /// escape script text. HTML void/raw-text rules silently destroy XML data.
+    pub fn outer_xml(&self, node_id: NodeId) -> String {
+        let mut buf = String::new();
+        self.serialize_worklist(vec![SerializeWork::Node(node_id, true)], &mut buf, true);
         buf
     }
 
     pub fn inner_html(&self, node_id: NodeId) -> String {
         let mut buf = String::new();
-        self.serialize_worklist(self.child_work(self.content_source(node_id)), &mut buf);
+        self.serialize_worklist(self.child_work(self.content_source(node_id)), &mut buf, false);
         buf
     }
 
@@ -47,7 +55,7 @@ impl DomTree {
             .collect()
     }
 
-    fn serialize_worklist(&self, mut stack: Vec<SerializeWork>, buf: &mut String) {
+    fn serialize_worklist(&self, mut stack: Vec<SerializeWork>, buf: &mut String, xml: bool) {
         // Defense in depth, mirroring descendants(): a well-formed subtree emits
         // at most one Node plus one CloseTag per node, so 2*nodes.len() work
         // items bound a valid walk. Exceeding it means the graph is cyclic (the
@@ -93,7 +101,10 @@ impl DomTree {
                     buf.push('>');
                 }
                 NodeData::Element { name, attrs, template_contents, .. } => {
-                    let tag = name.local.as_ref();
+                    let qualified = if xml {
+                        name.prefix.as_ref().map(|prefix| format!("{}:{}", prefix, name.local))
+                    } else { None };
+                    let tag = qualified.as_deref().unwrap_or(name.local.as_ref());
                     if include_self {
                         buf.push('<');
                         buf.push_str(tag);
@@ -105,13 +116,27 @@ impl DomTree {
                             }
                             buf.push_str(attr.name.local.as_ref());
                             buf.push_str("=\"");
-                            escape_attr(&attr.value, buf);
+                            if xml {
+                                for c in attr.value.chars() {
+                                    match c {
+                                        '&' => buf.push_str("&amp;"),
+                                        '<' => buf.push_str("&lt;"),
+                                        '"' => buf.push_str("&quot;"),
+                                        '\t' => buf.push_str("&#9;"),
+                                        '\n' => buf.push_str("&#10;"),
+                                        '\r' => buf.push_str("&#13;"),
+                                        _ => buf.push(c),
+                                    }
+                                }
+                            } else {
+                                escape_attr(&attr.value, buf);
+                            }
                             buf.push('"');
                         }
                         buf.push('>');
                     }
 
-                    if !is_void_element(tag) {
+                    if xml || !is_void_element(tag) {
                         // Push the closing tag first so it pops after all the
                         // children we push next.
                         if include_self {
@@ -138,7 +163,7 @@ impl DomTree {
                         })
                         .unwrap_or(false);
 
-                    if parent_is_raw {
+                    if parent_is_raw && !xml {
                         buf.push_str(contents);
                     } else {
                         escape_text(contents, buf);
@@ -169,7 +194,7 @@ impl DomTree {
                     buf.push_str(target);
                     buf.push(' ');
                     buf.push_str(data);
-                    buf.push('>');
+                    buf.push_str(if xml { "?>" } else { ">" });
                 }
             }
         }
@@ -224,6 +249,19 @@ mod tests {
         assert!(html.contains(r#"<div id="test">"#));
         assert!(html.contains("<p>Hello</p>"));
         assert!(html.contains("</div>"));
+    }
+
+    #[test]
+    fn test_xml_mode_preserves_void_children_without_changing_html() {
+        let tree = parse_html(r#"<source id="lesson"><script id="code">a < b</script>"#);
+        let source = tree.get_element_by_id("lesson").unwrap();
+        let text = tree.new_node(NodeData::Text { contents: "lesson <copy> & source".into() });
+        tree.append_child(source, text);
+        assert_eq!(tree.outer_html(source), r#"<source id="lesson">"#);
+        assert_eq!(tree.outer_xml(source), r#"<source id="lesson">lesson &lt;copy&gt; &amp; source</source>"#);
+        let script = tree.get_element_by_id("code").unwrap();
+        assert_eq!(tree.outer_html(script), r#"<script id="code">a < b</script>"#);
+        assert_eq!(tree.outer_xml(script), r#"<script id="code">a &lt; b</script>"#);
     }
 
     #[test]

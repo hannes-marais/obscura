@@ -11843,14 +11843,16 @@ globalThis.XMLSerializer = class XMLSerializer {
       s += ">";
       return s;
     }
-    if (node.outerHTML !== undefined) return node.outerHTML;
+    // XML serialization has no HTML void elements or raw-text exceptions.
+    // outerHTML loses curriculum <source> contents and produces invalid XML.
+    if (node.nodeType === 1 && node._nid !== undefined) return _domParse("outer_xml", node._nid) ?? "";
     if (node.nodeType === 9) {
       let s = "";
       if (node.doctype) s += this.serializeToString(node.doctype);
-      if (node.documentElement) s += node.documentElement.outerHTML;
+      if (node.documentElement) s += this.serializeToString(node.documentElement);
       return s;
     }
-    if (node.nodeType === 3) return node.textContent || "";
+    if (node.nodeType === 3) return String(node.textContent || "").replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
     if (node.nodeType === 8) return "<!--" + (node.textContent || "") + "-->";
     return "";
   }

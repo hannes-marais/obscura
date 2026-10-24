@@ -2753,6 +2753,10 @@ fn op_dom_inner(shared: SharedState, cmd: String, arg1: String, arg2: String) ->
             let nid = arg1.parse::<u32>().unwrap_or(0);
             serde_json::to_string(&dom.inner_html(NodeId::new(nid))).unwrap_or("\"\"".into())
         }
+        "outer_xml" => {
+            let nid = arg1.parse::<u32>().unwrap_or(0);
+            serde_json::to_string(&dom.outer_xml(NodeId::new(nid))).unwrap_or("\"\"".into())
+        }
         "outer_html" => {
             let nid = arg1.parse::<u32>().unwrap_or(0);
             serde_json::to_string(&dom.outer_html(NodeId::new(nid))).unwrap_or("\"\"".into())
