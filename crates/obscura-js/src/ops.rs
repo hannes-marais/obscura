@@ -1071,13 +1071,22 @@ struct FetchNetworkGuard {
     cancel: Option<Rc<CancelHandle>>,
 }
 
+// reqwest's Display omits the cause (TLS, DNS, timeout, connection reset).
+// Keep that evidence in the browser/SQLite event without copying query tokens
+// or userinfo from the request URL into a second diagnostic string.
+fn fetch_transport_error(error: reqwest::Error) -> String {
+    let flags = format!("timeout={} connect={} request={} body={} decode={}",
+        error.is_timeout(), error.is_connect(), error.is_request(), error.is_body(), error.is_decode());
+    format!("fetch transport failed ({flags}): {:?}", error.without_url())
+}
+
 impl Drop for FetchNetworkGuard {
     fn drop(&mut self) {
         let Some(mut event) = self.event.take() else { return; };
         event.status = 0;
         event.error_text = Some(if self.cancel.as_ref().is_some_and(|cancel| cancel.is_canceled()) {
-            "net::ERR_ABORTED"
-        } else { "net::ERR_FAILED" }.into());
+            "net::ERR_ABORTED".into()
+        } else { event.error_text.take().unwrap_or_else(|| "net::ERR_FAILED".into()) });
         event.timestamp = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)
             .unwrap_or_default().as_secs_f64();
         if let Some(state) = self.state.upgrade() {
@@ -4369,7 +4378,13 @@ async fn fetch_url_inner(
                 counter.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 PageInFlightGuard(counter.clone())
             });
-            req.send().await.map_err(|error| deno_error::JsErrorBox::generic(error.to_string()))?
+            req.send().await.map_err(|error| {
+                let detail = fetch_transport_error(error);
+                if let Some(event) = network_guard.event.as_mut() {
+                    event.error_text = Some(format!("net::ERR_FAILED: {detail}"));
+                }
+                deno_error::JsErrorBox::generic(detail)
+            })?
         };
         resource_response(&state, &request_id, &current_url,
             resp.headers().get("timing-allow-origin").and_then(|value| value.to_str().ok()).unwrap_or(""),
@@ -4885,6 +4900,17 @@ mod tests {
     };
     use crate::runtime::ObscuraJsRuntime;
     use obscura_dom::parse_html;
+
+    #[test]
+    fn fetch_transport_context_retains_cause_without_request_credentials() {
+        let error = reqwest::Client::new()
+            .get("https://user:PRIVATE_PASSWORD@example.test:invalid/?token=PRIVATE_TOKEN")
+            .build().unwrap_err();
+        let detail = super::fetch_transport_error(error);
+        assert!(detail.contains("timeout=false connect=false"), "{detail}");
+        assert!(detail.contains("source:"), "The underlying cause must survive: {detail}");
+        assert!(!detail.contains("PRIVATE_PASSWORD") && !detail.contains("PRIVATE_TOKEN"), "{detail}");
+    }
 
     // #678: Web Storage lives in Rust, keyed by origin, so these pin the
     // behaviour the realm-local object could not provide.
