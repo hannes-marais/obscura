@@ -79,16 +79,6 @@ opt-level = 3
 [profile.dev.package.tiny-skia-path]
 opt-level = 3
 
-# The same Debug journeys spend synchronous task budget in HTML fragment
-# parsing and deferred flex sizing (vm-t3fo). Keep these dependency loops
-# optimized across warm builds; do not switch the factory to Release or raise
-# browser/test budgets to compensate for unoptimized dependency execution.
-[profile.dev.package.html5ever]
-opt-level = 3
-
-[profile.dev.package.taffy]
-opt-level = 3
-
 [profile.release]
 panic = "unwind"
 
