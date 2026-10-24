@@ -91,6 +91,12 @@ opt-level = 3
 [profile.dev.package.obscura-render]
 opt-level = 3
 
+# Live Drive feedback still samples nested flex layout after paint is fast.
+# Compile the stable layout dependency once with optimization; source builds
+# stay Debug and reuse the same Anvil cache.
+[profile.dev.package.taffy]
+opt-level = 3
+
 [profile.release]
 panic = "unwind"
 
