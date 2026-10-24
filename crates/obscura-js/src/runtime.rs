@@ -8925,6 +8925,39 @@ mod tests {
     }
 
     #[test]
+    fn button_brand_preserves_radio_focus_across_renderer_remount() {
+        let mut rt = setup_runtime(
+            r#"<html><body><div id="host"><input name="lessons" type="radio" value="smc"></div>
+                <button id="button">Choose</button><div id="other"></div></body></html>"#,
+        );
+        let result = rt.evaluate(r#"
+            const host = document.getElementById('host');
+            const input = host.querySelector('input');
+            const button = document.getElementById('button');
+            const brands = [button, input, document.getElementById('other'),
+                document.createElement('button'), button.cloneNode(),
+                document.createElementNS('http://www.w3.org/1999/xhtml', 'x:button'),
+                document.createElementNS('urn:test', 'BUTTON').cloneNode()]
+                .map(node => node instanceof HTMLButtonElement);
+            input.focus();
+            const active = document.activeElement;
+            // The actual semantic renderer excludes unnamed buttons, not radios.
+            const saved = active instanceof HTMLInputElement && host.contains(active)
+                && !(active instanceof HTMLButtonElement && !active.id)
+                ? { name: active.name, value: active.value } : null;
+            host.replaceChildren(input.cloneNode());
+            const replacement = host.querySelector('input');
+            if (saved && replacement.name === saved.name && replacement.value === saved.value)
+                replacement.focus({ preventScroll: true });
+            return [brands, saved !== null, document.activeElement === replacement,
+                replacement instanceof HTMLInputElement, replacement instanceof HTMLButtonElement];
+        "#).unwrap();
+        assert_eq!(result, serde_json::json!([
+            [true, false, false, true, true, true, false], true, true, true, false
+        ]));
+    }
+
+    #[test]
     fn input_brand_separates_button_labels_and_preserves_native_setters() {
         let mut rt = setup_runtime(
             r#"<html><body><button id="button" type="button">Visible label</button>

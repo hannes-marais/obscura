@@ -7112,6 +7112,9 @@ function _elementClassFor(nid) {
   if (tag === "INPUT" && globalThis.HTMLInputElement
       && _domParse("namespace_uri", nid) === "http://www.w3.org/1999/xhtml"
       && _domParse("local_name", nid) === "input") return globalThis.HTMLInputElement;
+  if (tag === "BUTTON" && globalThis.HTMLButtonElement
+      && _domParse("namespace_uri", nid) === "http://www.w3.org/1999/xhtml"
+      && _domParse("local_name", nid) === "button") return globalThis.HTMLButtonElement;
   if (tag === "TEXTAREA" && globalThis.HTMLTextAreaElement) return globalThis.HTMLTextAreaElement;
   if (tag === "SELECT" && globalThis.HTMLSelectElement) return globalThis.HTMLSelectElement;
   if (tag === "DETAILS" && globalThis.HTMLDetailsElement) return globalThis.HTMLDetailsElement;
@@ -7144,6 +7147,7 @@ function _elementClassForKnownName(namespace, qualifiedName) {
     const tag = localName.toUpperCase();
     if (tag === "FORM" && globalThis.HTMLFormElement) return globalThis.HTMLFormElement;
     if (localName === "input" && globalThis.HTMLInputElement) return globalThis.HTMLInputElement;
+    if (localName === "button" && globalThis.HTMLButtonElement) return globalThis.HTMLButtonElement;
     if (tag === "TEXTAREA" && globalThis.HTMLTextAreaElement) return globalThis.HTMLTextAreaElement;
     if (tag === "SELECT" && globalThis.HTMLSelectElement) return globalThis.HTMLSelectElement;
     if (tag === "DETAILS" && globalThis.HTMLDetailsElement) return globalThis.HTMLDetailsElement;
@@ -13402,7 +13406,9 @@ Object.defineProperties(HTMLInputElement.prototype, {
   value: Object.getOwnPropertyDescriptor(Element.prototype, 'value'),
   checked: Object.getOwnPropertyDescriptor(Element.prototype, 'checked'),
 });
-globalThis.HTMLButtonElement = Element;
+// A button is a distinct interface. Aliasing Element makes every unnamed
+// radio fail renderers' "unnamed button" focus-continuity guard.
+globalThis.HTMLButtonElement = class HTMLButtonElement extends Element {};
 globalThis.HTMLFormElement = class HTMLFormElement extends Element {
   get elements() { return HTMLCollection._from(this.querySelectorAll("input, select, textarea, button, fieldset, output, object")); }
   get length() { return this.elements.length; }
