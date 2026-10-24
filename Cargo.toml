@@ -97,6 +97,12 @@ opt-level = 3
 [profile.dev.package.taffy]
 opt-level = 3
 
+# Live receipt typing/feedback profiles now identify selector traversal in
+# op_dom (27 sampled stacks) as the remaining hot native loop. Preserve the
+# Debug build and symbols; cache this small core library optimized once.
+[profile.dev.package.obscura-dom]
+opt-level = 3
+
 [profile.release]
 panic = "unwind"
 
