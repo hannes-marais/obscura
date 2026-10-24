@@ -931,7 +931,10 @@ pub(crate) fn record_module_completion(
     started: std::time::Instant, requested_url: &str, response: Option<&Response>, error: Option<String>,
 ) {
     // A completion from a replaced document must not populate the new realm.
-    if gs.navigation_timing.origin != navigation_origin || gs.url != document_url { return; }
+    // History/hash navigation keeps this clock: comparing full URLs loses
+    // later lazy-module measurements on ordinary SPA route changes.
+    if gs.navigation_timing.origin != navigation_origin ||
+        request_origin(&gs.url) != request_origin(document_url) { return; }
     static MODULE_REQUEST: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
     let request_id = format!("module-{}", MODULE_REQUEST.fetch_add(1, std::sync::atomic::Ordering::Relaxed));
     let millis = |at: std::time::Instant| at.saturating_duration_since(navigation_origin).as_secs_f64() * 1_000.0;
@@ -9080,5 +9083,16 @@ mod module_timing_tests {
         assert_eq!(state.js_network_events[0].status, 0);
         assert_eq!(state.js_network_events[0].error_text.as_deref(), Some("cancelled"));
         assert_eq!(state.resource_timing_entries[0]["transferSize"], serde_json::json!(0));
+    }
+
+    #[test]
+    fn module_completion_survives_same_document_route_changes() {
+        let mut state = ObscuraState::new();
+        state.url = "https://app.test/new-route#details".into();
+        let origin = state.navigation_timing.monotonic_origin();
+        record_module_completion(&mut state, "https://app.test/initial", origin, origin,
+            "https://app.test/lazy.js", None, Some("cancelled".into()));
+        assert_eq!(state.js_network_events.len(), 1);
+        assert_eq!(state.resource_timing_entries[0]["name"], serde_json::json!("https://app.test/lazy.js"));
     }
 }

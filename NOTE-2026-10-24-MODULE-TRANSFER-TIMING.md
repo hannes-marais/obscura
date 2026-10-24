@@ -26,3 +26,17 @@ physical response among16 cache followers, and navigation-boundary rejection.
 The first fixture run exposed a missing document URL in the test runtime;
 fixtures now set the actual owning URL. Unknown encoded sizes on other
 transports remain unknown rather than using decoded bytes as wire evidence.
+
+Revision26cd690 passed the full render gate:2224 tests,5 existing skipped;
+the Anvil-built optimized main/worker passed the33/33 obstacle course.
+Installed Debug IA Tools0.1.677 carries this instrumentation. Live ASF run
+01a16d75-2936-7612-81d8-6594264b8d09 records the hosted gzip entry module as
+2426970 encoded bytes rather than zero,329818 above the existing2MiB budget.
+That payload failure must remain visible. The concurrent home-page-size task
+watchdog failure is separately retained in SQLite and Log Central.
+
+Follow-up: preserve lazy-module measurements across same-document SPA routes.
+The navigation clock and origin identify the document; a full-URL comparison
+incorrectly rejects hash/history changes. Both focused boundary tests pass.
+Full-engine gates and rollout for this follow-up remain separate from the
+26cd690 proof above.
