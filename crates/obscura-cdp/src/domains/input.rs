@@ -188,6 +188,16 @@ pub async fn handle(
     ctx: &mut CdpContext,
     session_id: &Option<String>,
 ) -> Result<Value, String> {
+    handle_with_command_id(0, method, params, ctx, session_id).await
+}
+
+pub(crate) async fn handle_with_command_id(
+    command_id: u64,
+    method: &str,
+    params: &Value,
+    ctx: &mut CdpContext,
+    session_id: &Option<String>,
+) -> Result<Value, String> {
     match method {
         "dispatchMouseEvent" => {
             let event_type = params.get("type").and_then(|v| v.as_str()).unwrap_or("");
@@ -459,6 +469,8 @@ pub async fn handle(
         }
         "dispatchKeyEvent" => {
             let event_type = params.get("type").and_then(|v| v.as_str()).unwrap_or("");
+            let event_metadata = crate::command_timing::key_event_type(event_type);
+            let _input = crate::command_timing::CommandStage::begin(command_id, "Input.dispatchKeyEvent", "input", event_metadata);
             let modifiers = params.get("modifiers").and_then(|v| v.as_u64()).unwrap_or(0);
             let (alt_key, ctrl_key, meta_key, shift_key) = modifier_flags(modifiers);
             let key = params.get("key").and_then(|v| v.as_str()).unwrap_or("");
@@ -486,10 +498,15 @@ pub async fn handle(
                             code = js_str(code),
                             virtual_key_code = virtual_key_code,
                         );
-                        if page.evaluate(&js).as_bool() == Some(false) {
+                        let accepted = {
+                            let _stage = crate::command_timing::CommandStage::begin(command_id, "Input.dispatchKeyEvent", "keydown_evaluate", event_metadata);
+                            page.evaluate(&js).as_bool()
+                        };
+                        if accepted == Some(false) {
                             return Ok(json!({}));
                         }
 
+                        let _default_action = crate::command_timing::CommandStage::begin(command_id, "Input.dispatchKeyEvent", "default_action", event_metadata);
                         if !text.is_empty() && text != "\r" && text != "\n" {
                             page.evaluate(&insert_text_js(text, false));
                         }
@@ -539,6 +556,7 @@ pub async fn handle(
                         }
                     }
                     "keyUp" => {
+                        let _stage = crate::command_timing::CommandStage::begin(command_id, "Input.dispatchKeyEvent", "keyup_evaluate", event_metadata);
                         let js = format!(
                             "(function() {{\
                                 var target = document.activeElement || document.body;\
@@ -553,7 +571,11 @@ pub async fn handle(
                     }
                     "char" => {
                         if !text.is_empty() {
-                            page.evaluate(&insert_text_js(text, false));
+                            {
+                                let _stage = crate::command_timing::CommandStage::begin(command_id, "Input.dispatchKeyEvent", "char_evaluate", event_metadata);
+                                page.evaluate(&insert_text_js(text, false));
+                            }
+                            let _settle = crate::command_timing::CommandStage::begin(command_id, "Input.dispatchKeyEvent", "char_settle", event_metadata);
                             // Pump event loop so Angular change detection picks up the input
                             page.settle(50).await;
                         }

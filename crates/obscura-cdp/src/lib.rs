@@ -13,3 +13,5 @@ pub use server::{
 };
 
 pub(crate) mod dialog;
+
+pub(crate) mod command_timing;

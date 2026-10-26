@@ -2126,10 +2126,21 @@ async fn process_cdp_message(
 
     tracing::debug!("CDP: {} (id={}, s={:?})", req.method, req.id, req.session_id);
 
-    prepare_dialog_handler(&req, ctx, reply_tx);
-    service_live_page_render_resources(ctx);
-    let response = dispatch::dispatch(&req, ctx).await;
-    service_live_page_render_resources(ctx);
+    let _command = crate::command_timing::CommandStage::begin(req.id, &req.method, "command", "");
+    {
+        let _stage = crate::command_timing::CommandStage::begin(req.id, &req.method, "prepare", "");
+        prepare_dialog_handler(&req, ctx, reply_tx);
+        service_live_page_render_resources(ctx);
+    }
+    let response = {
+        let _stage = crate::command_timing::CommandStage::begin(req.id, &req.method, "dispatch", "");
+        dispatch::dispatch(&req, ctx).await
+    };
+    {
+        let _stage = crate::command_timing::CommandStage::begin(req.id, &req.method, "post_resources", "");
+        service_live_page_render_resources(ctx);
+    }
+    let _reply = crate::command_timing::CommandStage::begin(req.id, &req.method, "response_enqueue", "");
 
     // Chromium CDP semantics: events emitted as a side-effect of a command
     // (e.g. Target.targetCreated + Target.attachedToTarget from

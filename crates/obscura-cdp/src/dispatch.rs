@@ -747,6 +747,7 @@ pub async fn dispatch(req: &CdpRequest, ctx: &mut CdpContext) -> CdpResponse {
     // audited to confirm it never reaches `JsRuntime::execute_script` or DOM
     // mutation that re-enters V8. (`get_session_page_mut` itself no longer
     // enters V8 as of #872, so calling it is not what gates a method here.)
+    let lock_stage = crate::command_timing::CommandStage::begin(req.id, &req.method, "v8_lock", "");
     let _v8_guard = if is_v8_free_method(&req.method) {
         None
     } else {
@@ -755,6 +756,8 @@ pub async fn dispatch(req: &CdpRequest, ctx: &mut CdpContext) -> CdpResponse {
         // serializing other connections (#430).
         Some(ctx.v8_lock.clone().lock_owned().await)
     };
+
+    drop(lock_stage);
 
     // Per-command V8 watchdog. The lock above keeps each handler contiguous on
     // the thread, but it does not bound how long a handler runs: a hung page (a
@@ -803,7 +806,7 @@ pub async fn dispatch(req: &CdpRequest, ctx: &mut CdpContext) -> CdpResponse {
         "Network" => domains::network::handle(method, &req.params, ctx, &req.session_id).await,
         "Fetch" => domains::fetch::handle(method, &req.params, ctx, &req.session_id).await,
         "IO" => domains::io::handle(method, &req.params, ctx).await,
-        "Input" => domains::input::handle(method, &req.params, ctx, &req.session_id).await,
+        "Input" => domains::input::handle_with_command_id(req.id, method, &req.params, ctx, &req.session_id).await,
         "Emulation" => domains::emulation::handle(method, &req.params, ctx, &req.session_id).await,
         "Storage" => domains::storage::handle(method, &req.params, ctx, &req.session_id).await,
         "LP" => domains::lp::handle(method, &req.params, ctx, &req.session_id).await,
