@@ -3503,6 +3503,7 @@ impl Page {
             .map(|title_id| dom.text_content(title_id))
             .unwrap_or_default();
 
+        self.dispatch_pagehide();
         self.dom = Some(dom);
         self.init_js();
         let author_stylesheets = self.fetch_stylesheets().await;
@@ -3746,9 +3747,25 @@ impl Page {
         }
     }
 
+    fn dispatch_pagehide(&mut self) {
+        if let Some(js) = &mut self.js {
+            // This engine discards the outgoing realm rather than retaining it
+            // in a back-forward cache. Let the document synchronously hand off
+            // tab-scoped state before its realm and locks are destroyed.
+            if let Err(error) = js.execute_script_with_timeout(
+                "<pagehide>",
+                "(() => { const event = new Event('pagehide'); event.persisted = false; window.dispatchEvent(event); })()",
+                std::time::Duration::from_secs(5),
+            ) {
+                tracing::warn!("pagehide handler failed: {}", error);
+            }
+        }
+    }
+
     pub fn navigate_blank(&mut self) {
         self.navigation_timing = NavigationTiming::default();
         self.retire_render_resources();
+        self.dispatch_pagehide();
         self.pending_frame_work.clear();
         self.frames.clear();
         self.js = None;
@@ -5035,6 +5052,27 @@ mod tests {
             document.documentElement.nodeName, document.head.nodeName, document.body.nodeName
         ])()"#), serde_json::json!(["BackCompat", null, [1], "HTML", "HEAD", "BODY"]));
         assert!(page.with_dom(|dom| dom.is_quirks()).unwrap());
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn navigation_dispatches_pagehide_before_replacing_document() {
+        let (url, _) = spawn_storage_server().await;
+        let context = std::sync::Arc::new(crate::BrowserContext::with_storage_and_network(
+            "pagehide".into(), None, false, None, None, true,
+        ));
+        let mut page = super::Page::new("pagehide".into(), context);
+        page.navigate(&url).await.unwrap();
+        page.evaluate(r#"(() => {
+            sessionStorage.removeItem('pagehide-test');
+            window.addEventListener('pagehide', event => {
+                sessionStorage.setItem('pagehide-test', String(event.persisted));
+            });
+        })()"#);
+        // An invalid navigation does not commit a replacement document.
+        assert!(page.navigate("not a url").await.is_err());
+        assert_eq!(page.evaluate("sessionStorage.getItem('pagehide-test')"), serde_json::Value::Null);
+        page.navigate(&url).await.unwrap();
+        assert_eq!(page.evaluate("sessionStorage.getItem('pagehide-test')"), serde_json::json!("false"));
     }
 
     #[tokio::test(flavor = "current_thread")]
