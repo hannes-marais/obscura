@@ -476,6 +476,8 @@ pub(crate) async fn handle_with_command_id(
             let key = params.get("key").and_then(|v| v.as_str()).unwrap_or("");
             let code = params.get("code").and_then(|v| v.as_str()).unwrap_or("");
             let text = params.get("text").and_then(|v| v.as_str()).unwrap_or("");
+            let space = key == " " || key == "Space" || code == "Space";
+            let auto_repeat = params.get("autoRepeat").and_then(|v| v.as_bool()).unwrap_or(false);
             let virtual_key_code = params
                 .get("windowsVirtualKeyCode")
                 .and_then(|v| v.as_u64())
@@ -484,10 +486,13 @@ pub(crate) async fn handle_with_command_id(
             if let Some(page) = ctx.get_session_page_mut(session_id) {
                 match event_type {
                     "keyDown" | "rawKeyDown" => {
+                        if space && !auto_repeat {
+                            page.evaluate("(function(){globalThis.__obscura_spaceActivationTarget = null; globalThis.__obscura_spaceKeydownTarget = document.activeElement;})()");
+                        }
                         let js = format!(
                             "(function() {{\
                                 var target = document.activeElement || document.body;\
-                                var evt = globalThis.__obscura_markTrusted(new KeyboardEvent('keydown', {{bubbles:true,cancelable:true,key:{key},code:{code},keyCode:{virtual_key_code},which:{virtual_key_code},altKey:{alt_key},ctrlKey:{ctrl_key},metaKey:{meta_key},shiftKey:{shift_key}}}));\
+                                var evt = globalThis.__obscura_markTrusted(new KeyboardEvent('keydown', {{bubbles:true,cancelable:true,key:{key},code:{code},keyCode:{virtual_key_code},which:{virtual_key_code},repeat:{auto_repeat},altKey:{alt_key},ctrlKey:{ctrl_key},metaKey:{meta_key},shiftKey:{shift_key}}}));\
                                 return target.dispatchEvent(evt);\
                             }})()",
                             // Escape backslash BEFORE single-quote (as the text
@@ -503,10 +508,17 @@ pub(crate) async fn handle_with_command_id(
                             page.evaluate(&js).as_bool()
                         };
                         if accepted == Some(false) {
+                            if space { page.evaluate("globalThis.__obscura_spaceKeydownTarget = null"); }
                             return Ok(json!({}));
                         }
 
                         let _default_action = crate::command_timing::CommandStage::begin(command_id, "Input.dispatchKeyEvent", "default_action", event_metadata);
+                        if space {
+                            let js = "(function(){var t=document.activeElement;if(t && (t===globalThis.__obscura_spaceKeydownTarget || ($REPEAT && t===globalThis.__obscura_spaceActivationTarget)) && !t.disabled && (t.localName==='button' || (t.localName==='input' && /^(button|submit|reset|image)$/.test(t.type)))) {if(!$REPEAT) globalThis.__obscura_spaceActivationTarget=t;t.dispatchEvent(globalThis.__obscura_markTrusted(new KeyboardEvent('keypress',{bubbles:true,cancelable:true,key:' ',code:'Space',keyCode:32,which:32,charCode:32,repeat:$REPEAT,$MODIFIERS})));}globalThis.__obscura_spaceKeydownTarget=null;})()"
+                                .replace("$REPEAT", if auto_repeat { "true" } else { "false" })
+                                .replace("$MODIFIERS", &format!("altKey:{alt_key},ctrlKey:{ctrl_key},metaKey:{meta_key},shiftKey:{shift_key}"));
+                            page.evaluate(&js);
+                        }
                         if !text.is_empty() && text != "\r" && text != "\n" {
                             page.evaluate(&insert_text_js(text, false));
                         }
@@ -560,12 +572,14 @@ pub(crate) async fn handle_with_command_id(
                         let js = format!(
                             "(function() {{\
                                 var target = document.activeElement || document.body;\
-                                var evt = globalThis.__obscura_markTrusted(new KeyboardEvent('keyup', {{bubbles:true,key:{key},code:{code},keyCode:{virtual_key_code},which:{virtual_key_code},altKey:{alt_key},ctrlKey:{ctrl_key},metaKey:{meta_key},shiftKey:{shift_key}}}));\
-                                target.dispatchEvent(evt);\
+                                var evt = globalThis.__obscura_markTrusted(new KeyboardEvent('keyup', {{bubbles:true,cancelable:true,key:{key},code:{code},keyCode:{virtual_key_code},which:{virtual_key_code},altKey:{alt_key},ctrlKey:{ctrl_key},metaKey:{meta_key},shiftKey:{shift_key}}}));\
+                                var accepted = target.dispatchEvent(evt);\
+                                if ({space}) {{ var pending=globalThis.__obscura_spaceActivationTarget; globalThis.__obscura_spaceActivationTarget=null; if (accepted && pending && pending===target && pending===document.activeElement && !pending.disabled) globalThis.__obscura_activateElement(pending); }}\
                             }})()",
                             key = js_str(key),
                             code = js_str(code),
                             virtual_key_code = virtual_key_code,
+                            space = space,
                         );
                         page.evaluate(&js);
                     }

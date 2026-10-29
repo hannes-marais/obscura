@@ -373,6 +373,46 @@ async fn enter_button_activation_respects_keydown_keypress_and_click_cancellatio
 }
 
 #[tokio::test(flavor = "current_thread")]
+async fn space_activates_only_on_release_and_respects_cancellation_and_focus() {
+    let mut ctx = CdpContext::new();
+    let page = ctx.create_page();
+    let sid = "space-button-activation";
+    ctx.sessions.insert(sid.into(), page);
+    cdp(&mut ctx, 1, "Runtime.evaluate", json!({"expression":r#"
+        document.body.innerHTML='<button id="first">first</button><button id="second">second</button>';
+        globalThis.clicks=[];globalThis.presses=[];globalThis.downState=null;
+        for(const b of document.querySelectorAll('button')) { b.addEventListener('click',e=>clicks.push([b.id,e.isTrusted,e.detail])); b.addEventListener('keypress',e=>presses.push([b.id,e.key,e.isTrusted])); }
+        document.getElementById('first').addEventListener('keydown',()=>downState=[document.activeElement===globalThis.__obscura_spaceKeydownTarget,document.activeElement.localName,document.activeElement.disabled]);
+        document.getElementById('first').focus();
+    "#,"returnByValue":true}), sid).await;
+    let down = json!({"type":"keyDown","key":" ","code":"Space","windowsVirtualKeyCode":32});
+    let up = json!({"type":"keyUp","key":" ","code":"Space","windowsVirtualKeyCode":32});
+    cdp(&mut ctx, 2, "Input.dispatchKeyEvent", down.clone(), sid).await;
+    let before = cdp(&mut ctx, 3, "Runtime.evaluate", json!({"expression":"JSON.stringify(clicks)","returnByValue":true}), sid).await;
+    assert_eq!(before["result"]["value"], "[]");
+    let state = cdp(&mut ctx, 30, "Runtime.evaluate", json!({"expression":"JSON.stringify({active:document.activeElement?.id,pending:globalThis.__obscura_spaceActivationTarget?.id,presses,downState})","returnByValue":true}), sid).await;
+    assert_eq!(state["result"]["value"], "{\"active\":\"first\",\"pending\":\"first\",\"presses\":[[\"first\",\" \",true]],\"downState\":[true,\"button\",false]}");
+    cdp(&mut ctx, 4, "Input.dispatchKeyEvent", up.clone(), sid).await;
+    cdp(&mut ctx, 5, "Runtime.evaluate", json!({"expression":"document.getElementById('first').addEventListener('keydown',e=>e.preventDefault(),{once:true})","returnByValue":true}), sid).await;
+    cdp(&mut ctx, 6, "Input.dispatchKeyEvent", down.clone(), sid).await;
+    cdp(&mut ctx, 7, "Input.dispatchKeyEvent", up.clone(), sid).await;
+    cdp(&mut ctx, 8, "Input.dispatchKeyEvent", down, sid).await;
+    cdp(&mut ctx, 9, "Runtime.evaluate", json!({"expression":"document.getElementById('second').focus()","returnByValue":true}), sid).await;
+    cdp(&mut ctx, 10, "Input.dispatchKeyEvent", up, sid).await;
+    let after = cdp(&mut ctx, 11, "Runtime.evaluate", json!({"expression":"JSON.stringify(clicks)","returnByValue":true}), sid).await;
+    assert_eq!(after["result"]["value"], "[[\"first\",true,0]]");
+    cdp(&mut ctx, 12, "Input.dispatchKeyEvent", json!({"type":"keyDown","key":" ","code":"Space","windowsVirtualKeyCode":32,"modifiers":8}), sid).await;
+    cdp(&mut ctx, 13, "Input.dispatchKeyEvent", json!({"type":"keyUp","key":" ","code":"Space","windowsVirtualKeyCode":32,"modifiers":8}), sid).await;
+    let shifted = cdp(&mut ctx, 14, "Runtime.evaluate", json!({"expression":"JSON.stringify({clicks,presses})","returnByValue":true}), sid).await;
+    assert_eq!(shifted["result"]["value"], "{\"clicks\":[[\"first\",true,0],[\"second\",true,0]],\"presses\":[[\"first\",\" \",true],[\"first\",\" \",true],[\"second\",\" \",true]]}");
+    cdp(&mut ctx, 15, "Runtime.evaluate", json!({"expression":"document.getElementById('second').addEventListener('keyup',()=>document.getElementById('first').focus(),{once:true})","returnByValue":true}), sid).await;
+    cdp(&mut ctx, 16, "Input.dispatchKeyEvent", json!({"type":"keyDown","key":" ","code":"Space","windowsVirtualKeyCode":32}), sid).await;
+    cdp(&mut ctx, 17, "Input.dispatchKeyEvent", json!({"type":"keyUp","key":" ","code":"Space","windowsVirtualKeyCode":32}), sid).await;
+    let moved = cdp(&mut ctx, 18, "Runtime.evaluate", json!({"expression":"JSON.stringify(clicks)","returnByValue":true}), sid).await;
+    assert_eq!(moved["result"]["value"], "[[\"first\",true,0],[\"second\",true,0]]");
+}
+
+#[tokio::test(flavor = "current_thread")]
 async fn submit_event_constructor_retains_readonly_submitter_and_defaults_to_null() {
     let mut ctx = CdpContext::new();
     let page = ctx.create_page();
