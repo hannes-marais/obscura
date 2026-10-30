@@ -5359,6 +5359,70 @@ mod tests {
 
     #[cfg(feature = "render")]
     #[test]
+    fn range_text_rects_follow_selected_text_not_parent_box() {
+        let mut rt = setup_runtime("<style>body{margin:0}#frame{width:400px;height:60px;font:20px/24px monospace}</style><div id=frame>Hi</div>");
+        let actual = rt.evaluate(r#"(() => {
+            const frame = document.getElementById('frame');
+            const range = document.createRange();
+            range.selectNodeContents(frame);
+            const rects = [...range.getClientRects()];
+            return { frame: frame.getBoundingClientRect().width, count: rects.length,
+                width: rects[0]?.width ?? 0, height: rects[0]?.height ?? 0 };
+        })()"#).unwrap();
+        assert_eq!(actual["count"], 1, "{actual}");
+        let width = actual["width"].as_f64().unwrap();
+        let frame = actual["frame"].as_f64().unwrap();
+        assert!(width > 0.0 && width < frame / 2.0, "range must measure text, not frame: {actual}");
+        assert!(actual["height"].as_f64().unwrap() > 0.0, "{actual}");
+    }
+
+    #[cfg(feature = "render")]
+    #[test]
+    fn range_text_rects_support_partial_utf16_and_wrapped_lines() {
+        let mut rt = setup_runtime("<style>body{margin:0}#frame{width:72px;font:20px/24px monospace;overflow-wrap:anywhere}</style><div id=frame>AB😀CDEFGHIJKL</div>");
+        let actual = rt.evaluate(r#"(() => {
+            const text = document.getElementById('frame').firstChild;
+            const full = document.createRange(); full.selectNodeContents(text);
+            const partial = document.createRange(); partial.setStart(text, 2); partial.setEnd(text, 4);
+            const caret = document.createRange(); caret.setStart(text, 2); caret.collapse(true);
+            const rects = range => [...range.getClientRects()].map(r => ({x:r.x,y:r.y,width:r.width,height:r.height}));
+            return {full:rects(full), partial:rects(partial), caret:rects(caret)};
+        })()"#).unwrap();
+        let full = actual["full"].as_array().unwrap();
+        let partial = actual["partial"].as_array().unwrap();
+        assert!(full.len() >= 2, "wrapped selection needs line fragments: {actual}");
+        assert_eq!(partial.len(), 1, "UTF-16 surrogate pair is one selected glyph: {actual}");
+        assert!(partial[0]["width"].as_f64().unwrap() > 0.0, "{actual}");
+        let caret = actual["caret"].as_array().unwrap();
+        assert_eq!(caret.len(), 1, "collapsed text range has caret geometry: {actual}");
+        assert_eq!(caret[0]["width"].as_f64().unwrap(), 0.0, "{actual}");
+        assert!(caret[0]["height"].as_f64().unwrap() > 0.0, "{actual}");
+    }
+
+    #[cfg(feature = "render")]
+    #[test]
+    fn range_text_rects_across_nested_nodes_have_a_consistent_union() {
+        let mut rt = setup_runtime("<style>body{margin:0}#frame{font:20px/24px monospace}</style><div id=frame><span>AB</span><span>CD</span></div>");
+        let actual = rt.evaluate(r#"(() => {
+            const frame = document.getElementById('frame');
+            const range = document.createRange();
+            range.setStart(frame.firstChild.firstChild, 1);
+            range.setEnd(frame.lastChild.firstChild, 1);
+            const rects = [...range.getClientRects()].map(r => ({left:r.left,right:r.right,width:r.width}));
+            const bounds = range.getBoundingClientRect();
+            return {rects, bounds:{left:bounds.left,right:bounds.right,width:bounds.width}};
+        })()"#).unwrap();
+        let rects = actual["rects"].as_array().unwrap();
+        assert_eq!(rects.len(), 2, "one fragment per partially selected text node: {actual}");
+        assert!(rects.iter().all(|r| r["width"].as_f64().unwrap() > 0.0), "{actual}");
+        let left = rects.iter().map(|r| r["left"].as_f64().unwrap()).fold(f64::INFINITY, f64::min);
+        let right = rects.iter().map(|r| r["right"].as_f64().unwrap()).fold(f64::NEG_INFINITY, f64::max);
+        assert!((actual["bounds"]["left"].as_f64().unwrap() - left).abs() < 0.01, "{actual}");
+        assert!((actual["bounds"]["right"].as_f64().unwrap() - right).abs() < 0.01, "{actual}");
+    }
+
+    #[cfg(feature = "render")]
+    #[test]
     fn synchronous_iframe_geometry_uses_the_owning_document() {
         let mut rt = setup_runtime(
             "<html><head><style>body{margin:4px}#parent{width:45px;height:30px}</style></head><body><div id='parent'></div></body></html>");

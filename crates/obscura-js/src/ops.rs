@@ -7659,6 +7659,7 @@ pub fn build_extension() -> Extension {
         ops.push(op_layout_hit_test());
         ops.push(op_layout_caret());
         ops.push(op_layout_caret_rect());
+        ops.push(op_layout_text_range_rects());
         ops.push(op_resize_observer_measurements());
         ops.push(op_intersection_observer_measurements());
         ops.push(op_computed_style());
@@ -8748,6 +8749,29 @@ fn op_layout_caret_rect(state: &OpState, #[string] nid: String, offset: u32, fra
         let rect = gs.prepared_render.as_ref()?.caret_rect(gs.dom.as_ref()?, scroll, node, offset as usize)?;
         Some(serde_json::json!({"x": rect.x, "y": rect.y,
             "width": rect.width, "height": rect.height}).to_string())
+    })).ok().flatten().unwrap_or_default()
+}
+
+/// Resolve all selected text fragments against one prepared layout snapshot.
+#[cfg(feature = "render")]
+#[op2]
+#[string]
+fn op_layout_text_range_rects(state: &OpState, #[string] ranges: String, frame_id: u32) -> String {
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let ranges: Vec<(String, u32, u32)> = serde_json::from_str(&ranges).ok()?;
+        let shared = frame_state(state, frame_id);
+        let mut gs = shared.borrow_mut();
+        sample_live_document_animations(&mut gs);
+        ensure_resolved_scroll_for_geometry(&mut gs)?;
+        let (_, scroll) = gs.resolved_scroll.as_ref()?;
+        let prepared = gs.prepared_render.as_ref()?;
+        let dom = gs.dom.as_ref()?;
+        let result: Vec<Vec<_>> = ranges.into_iter().map(|(id, start, end)| {
+            let Ok(id) = id.parse() else { return Vec::new(); };
+            prepared.text_range_rects(dom, scroll, NodeId::new(id), start as usize, end as usize)
+                .into_iter().map(|r| serde_json::json!({"x":r.x,"y":r.y,"width":r.width,"height":r.height})).collect()
+        }).collect();
+        Some(serde_json::to_string(&result).ok()?)
     })).ok().flatten().unwrap_or_default()
 }
 

@@ -2342,6 +2342,49 @@ impl TextEngine {
         }
         None
     }
+
+    /// Rectangles of a UTF-16 text-node interval in the retained shaped runs.
+    /// The caller applies the formatting context's viewport transform and scroll.
+    pub(crate) fn text_range_rects(
+        &self, index: usize, parent: NodeId, tree: &DomTree,
+        styles: &HashMap<NodeId, LayoutStyle>, node: NodeId, start: usize, end: usize,
+    ) -> Vec<Rect> {
+        if start >= end { return Vec::new(); }
+        let Some(item) = self.items.get(index) else { return Vec::new(); };
+        let Some((source, boundaries)) = self.caret_source(index, parent, tree, styles) else { return Vec::new(); };
+        let boundary = |offset: usize| boundaries.iter().filter(|b| b.node == node)
+            .min_by_key(|b| b.offset.abs_diff(offset)).map(|b| b.byte);
+        let (Some(start), Some(end)) = (boundary(start), boundary(end)) else { return Vec::new(); };
+        if start >= end { return Vec::new(); }
+        let Some(style) = tree.with_node(node, |node| node.parent).flatten()
+            .and_then(|id| styles.get(&id)).or_else(|| styles.get(&parent)) else { return Vec::new(); };
+        let (ascent, descent) = self.inline_font_box_metrics(style);
+        let starts = source_line_starts(&item.buffer, &source);
+        let mut rects = Vec::new();
+        for (line_index, run) in item.buffer.layout_runs().enumerate() {
+            if item.line_clamp.is_some_and(|limit| line_index >= limit) { break; }
+            let Some(&line_start) = starts.get(run.line_i) else { continue; };
+            let line_end = line_start + run.text.len();
+            let selected_start = start.max(line_start);
+            let selected_end = end.min(line_end);
+            if selected_start >= selected_end { continue; }
+            let Some((x, width)) = run.highlight(
+                Cursor::new(run.line_i, selected_start - line_start),
+                Cursor::new(run.line_i, selected_end - line_start),
+            ) else { continue; };
+            let indent = if line_index == 0 { item.first_line_offset } else { 0.0 };
+            let relative = glyph_relative_offset(&item.relative_owner_ranges, line_start,
+                selected_start - line_start, selected_end - line_start);
+            rects.push(Rect {
+                x: item.origin.0 + x + indent + relative.0
+                    + line_edge_alignment_shift(item, line_start, line_end)
+                    + line_advance_before_text(item, selected_start, line_start, line_end),
+                y: item.origin.1 + run.line_y + relative.1 - ascent,
+                width, height: ascent + descent,
+            });
+        }
+        rects
+    }
 }
 
 /// A run of same-styled inline text.

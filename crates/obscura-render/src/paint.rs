@@ -1682,6 +1682,34 @@ impl PreparedRender {
         None
     }
 
+    /// Shaped line fragments for a selected text-node UTF-16 interval.
+    pub fn text_range_rects(
+        &self, tree: &DomTree, scroll: &ResolvedScrollState,
+        node: obscura_dom::tree::NodeId, start: usize, end: usize,
+    ) -> Vec<crate::Rect> {
+        for parent in std::iter::successors(crate::dom::rendered_parent(tree, node),
+            |id| crate::dom::rendered_parent(tree, *id)).take(tree.len() + 1)
+        {
+            let indices = self.layout.ifc_items.get(&parent).into_iter().copied()
+                .chain(self.layout.run_ifc_items.get(&parent).into_iter().flatten().copied());
+            let mut result = Vec::new();
+            for index in indices {
+                let rects = self.layout.text_engine.text_range_rects(index, parent, tree,
+                    &self.layout.styles, node, start, end);
+                let transform = self.layout.transforms.get(&parent).copied().unwrap_or_default();
+                let movement = scroll.movement_for(parent);
+                result.extend(rects.into_iter().map(|rect| {
+                    let mut rect = transform.map_rect(rect);
+                    rect.x += movement.0;
+                    rect.y += movement.1;
+                    rect
+                }));
+            }
+            if !result.is_empty() { return result; }
+        }
+        Vec::new()
+    }
+
     /// A compact CSSOM snapshot derived from the same final cascade and
     /// layout used by paint and geometry. Keeping this on `PreparedRender`
     /// lets script fetch all high-traffic computed properties in one op,

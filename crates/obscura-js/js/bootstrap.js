@@ -14210,18 +14210,61 @@ globalThis.Range = class Range {
   surroundContents(node) { this.insertNode(node); }
   detach() {}
   getBoundingClientRect() {
-    if (this.collapsed) return new DOMRect();
-    let cac = this.commonAncestorContainer;
-    while (cac && cac.nodeType !== 1 && cac.nodeType !== 9) cac = cac.parentNode;
-    if (cac && cac.getBoundingClientRect) {
-      const r = cac.getBoundingClientRect();
-      return new DOMRect(r.x, r.y, r.width, r.height);
-    }
-    return new DOMRect();
+    const rects = Array.from(this.getClientRects());
+    if (!rects.length) return new DOMRect();
+    const nonempty = rects.filter(r => r.width !== 0 || r.height !== 0);
+    const boxes = nonempty.length ? nonempty : [rects[0]];
+    const left = Math.min(...boxes.map(r => r.left));
+    const top = Math.min(...boxes.map(r => r.top));
+    const right = Math.max(...boxes.map(r => r.right));
+    const bottom = Math.max(...boxes.map(r => r.bottom));
+    return new DOMRect(left, top, right - left, bottom - top);
   }
   getClientRects() {
-    if (this.collapsed) return new DOMRectList([]);
-    return new DOMRectList([this.getBoundingClientRect()]);
+    if (this.collapsed) {
+      if ((this._sc?.nodeType === 3 || this._sc?.nodeType === 4)
+          && typeof __obscuraCore.ops.op_layout_caret_rect === 'function') {
+        const raw = __obscuraCore.ops.op_layout_caret_rect(String(this._sc._nid), this._so, _realmFrameId);
+        if (raw) {
+          const r = JSON.parse(raw);
+          return new DOMRectList([new DOMRect(r.x, r.y, r.width, r.height)]);
+        }
+      }
+      return new DOMRectList([]);
+    }
+    if (typeof __obscuraCore.ops.op_layout_text_range_rects !== 'function') {
+      let ancestor = this.commonAncestorContainer;
+      while (ancestor && ancestor.nodeType !== 1 && ancestor.nodeType !== 9) ancestor = ancestor.parentNode;
+      return new DOMRectList(ancestor?.getBoundingClientRect ? [ancestor.getBoundingClientRect()] : []);
+    }
+    const entries = [], ranges = [];
+    const visit = (node, parentSelected) => {
+      if (node.nodeType === 3 || node.nodeType === 4) {
+        const length = _rngNodeLength(node);
+        if (_rngCmp(this._sc, this._so, node, length) >= 0 || _rngCmp(this._ec, this._eo, node, 0) <= 0) return;
+        const start = _rngSame(this._sc, node) ? this._so : 0;
+        const end = _rngSame(this._ec, node) ? this._eo : length;
+        if (start < end) { entries.push({text:ranges.length}); ranges.push([String(node._nid), start, end]); }
+        return;
+      }
+      let selected = false;
+      if (node.nodeType === 1 && node.parentNode) {
+        const index = _rngNodeIndex(node);
+        selected = _rngCmp(this._sc, this._so, node.parentNode, index) <= 0
+          && _rngCmp(this._ec, this._eo, node.parentNode, index + 1) >= 0;
+        if (selected && !parentSelected) entries.push({element:node});
+      }
+      for (const child of Array.from(node.childNodes || [])) visit(child, selected || parentSelected);
+    };
+    visit(this.commonAncestorContainer, false);
+    const raw = __obscuraCore.ops.op_layout_text_range_rects(JSON.stringify(ranges), _realmFrameId);
+    const textRects = raw ? JSON.parse(raw) : [];
+    const rects = [];
+    for (const entry of entries) {
+      if (entry.element) rects.push(...entry.element.getClientRects());
+      else for (const r of textRects[entry.text] || []) rects.push(new DOMRect(r.x, r.y, r.width, r.height));
+    }
+    return new DOMRectList(rects);
   }
   static get START_TO_START() { return 0; }
   static get START_TO_END() { return 1; }
