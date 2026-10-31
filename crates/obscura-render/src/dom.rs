@@ -5151,7 +5151,6 @@ fn layout_dom_once(
     std::time::Duration,
 ) {
     let t1 = std::time::Instant::now();
-    let profile_layout = std::env::var_os("OBSCURA_PROFILE_DECKER_LAYOUT").is_some();
     let mut matcher = tree.matcher();
     let (mut styles, mut custom_properties, fresh_styles) = match retained {
         Some((retained, fresh)) => (retained.styles, retained.custom_properties, Some(fresh)),
@@ -5231,10 +5230,8 @@ fn layout_dom_once(
     let mut taffy_tree: TaffyTree<usize> = crate::new_taffy_tree();
     let mut id_map: HashMap<taffy::NodeId, NodeId> = HashMap::new();
     let mut words: HashMap<taffy::NodeId, (NodeId, String)> = HashMap::new();
-    let engine_start = std::time::Instant::now();
     let mut engine =
         crate::inline::TextEngine::new_with_web_fonts_and_emoji(fonts, needs_emoji_font);
-    let engine_elapsed = engine_start.elapsed();
     let mut ifc_items = IfcRegistry::default();
 
     // The document node itself is not an element; lay out from the first
@@ -6826,8 +6823,7 @@ fn layout_dom_once(
         let deferred_cyclic_inline_sizes =
             defer_cyclic_flex_inline_sizes(tree, &mut styles, root_fs, vw, vh);
 
-        let tree_start = std::time::Instant::now();
-        let built_root = build(
+        if let Some(taffy_root) = build(
             tree,
             root_id,
             &mut taffy_tree,
@@ -6836,12 +6832,7 @@ fn layout_dom_once(
             &mut engine,
             &mut ifc_items,
             &styles,
-        );
-        if profile_layout {
-            eprintln!("obscura-layout-phases engine_us={} tree_us={} nodes={} inline_contexts={}",
-                engine_elapsed.as_micros(), tree_start.elapsed().as_micros(), id_map.len(), engine.len());
-        }
-        if let Some(taffy_root) = built_root {
+        ) {
             // Taffy has no outer display type and only gives an auto-width
             // Block root the initial-containing-block width. CSS blockifies
             // Flex/Grid roots too, so supply the equivalent used width while
@@ -6934,28 +6925,15 @@ fn layout_dom_once(
                 width: taffy::AvailableSpace::Definite(initial_cb_width),
                 height: taffy::AvailableSpace::Definite(viewport.1),
             };
-            let measure_time = std::cell::Cell::new(0u128);
-            let measure_count = std::cell::Cell::new(0usize);
-            let contextual_count = std::cell::Cell::new(0usize);
-            let layout_start = std::time::Instant::now();
             let mut measure = |known: taffy::Size<Option<f32>>,
                                    avail: taffy::Size<taffy::AvailableSpace>,
                                    _node,
                                    ctx: Option<&mut usize>,
                                    _style: &taffy::Style| {
-                    let started = profile_layout.then(std::time::Instant::now);
-                    if profile_layout && ctx.is_some() {
-                        contextual_count.set(contextual_count.get() + 1);
-                    }
-                    let result = match ctx {
+                    match ctx {
                         Some(&mut idx) => engine.measure_taffy(idx, known, avail),
                         None => taffy::Size::ZERO,
-                    };
-                    if let Some(started) = started {
-                        measure_time.set(measure_time.get() + started.elapsed().as_nanos());
-                        measure_count.set(measure_count.get() + 1);
                     }
-                    result
                 };
 
             #[cfg(feature = "paint")]
@@ -7605,10 +7583,6 @@ fn layout_dom_once(
                     );
                     let _ = taffy_tree.compute_layout_with_measure(taffy_root, available, &mut measure);
                 }
-            }
-            if profile_layout {
-                eprintln!("obscura-layout-measure layout_us={} measure_ns={} measure_count={} contextual_count={}",
-                    layout_start.elapsed().as_micros(), measure_time.get(), measure_count.get(), contextual_count.get());
             }
             sync_resolved_percentage_padding(
                 &taffy_tree,
