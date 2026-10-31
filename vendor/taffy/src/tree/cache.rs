@@ -10,6 +10,28 @@ use crate::RequestedAxis;
 /// The number of cache entries for each node in the tree
 const CACHE_SIZE: usize = 9;
 
+#[cfg(feature = "std")]
+mod temporary_cache_profile {
+    use std::sync::{OnceLock, atomic::{AtomicU64, Ordering}};
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    static HIT: AtomicU64 = AtomicU64::new(0);
+    static MISS: AtomicU64 = AtomicU64::new(0);
+    static STORE: AtomicU64 = AtomicU64::new(0);
+    static REPLACE: AtomicU64 = AtomicU64::new(0);
+    fn enabled() -> bool { *ENABLED.get_or_init(|| std::env::var_os("OBSCURA_PROFILE_TAFFY_CACHE").is_some()) }
+    pub fn hit() { if enabled() { HIT.fetch_add(1, Ordering::Relaxed); } }
+    pub fn miss() { if enabled() { MISS.fetch_add(1, Ordering::Relaxed); } }
+    pub fn store(replaced: bool) {
+        if !enabled() { return; }
+        if replaced { REPLACE.fetch_add(1, Ordering::Relaxed); }
+        let n = STORE.fetch_add(1, Ordering::Relaxed) + 1;
+        if n % 100_000 == 0 {
+            eprintln!("taffy-cache-profile stores={} hits={} misses={} replacements={}", n,
+                HIT.load(Ordering::Relaxed), MISS.load(Ordering::Relaxed), REPLACE.load(Ordering::Relaxed));
+        }
+    }
+}
+
 // Manually written-out results of float to u32 bit casts because
 // `f32::to_bits` is not yet const at our MSRV.
 
@@ -273,10 +295,14 @@ impl Cache {
                         && entry.content.vertical_margins_are_collapsible
                             == vertical_margin_context_key(input)
                     {
+                        #[cfg(feature = "std")]
+                        temporary_cache_profile::hit();
                         return Some(entry.content.into_layout_output());
                     }
                 }
 
+                #[cfg(feature = "std")]
+                temporary_cache_profile::miss();
                 None
             }
             RunMode::PerformHiddenLayout => None,
@@ -294,6 +320,9 @@ impl Cache {
             RunMode::ComputeSize => {
                 self.is_empty = false;
                 let cache_slot = Self::compute_cache_slot(input.known_dimensions, input.available_space);
+                #[cfg(feature = "std")]
+                temporary_cache_profile::store(self.measure_entries[cache_slot].is_some_and(|entry|
+                    entry.key != key || entry.content.vertical_margins_are_collapsible != vertical_margin_context_key(input)));
                 self.measure_entries[cache_slot] =
                     Some(CacheEntry { key, content: MeasureOutput::new(input, layout_output) });
             }
