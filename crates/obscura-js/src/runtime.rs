@@ -7947,6 +7947,35 @@ mod tests {
     }
 
     #[test]
+    fn cloned_null_namespace_xml_preserves_case_sensitive_attributes() {
+        let mut rt = setup_runtime("<html><body><div id='html'></div></body></html>");
+        let result = rt.evaluate(r#"(() => {
+            const doc = new DOMParser().parseFromString(
+                '<blocks><slide><image mediaType="image/png" byteCount="12"/></slide></blocks>', 'application/xml');
+            const root = doc.documentElement.cloneNode(true);
+            const image = root.querySelector('image');
+            image.setAttribute('mediaType', 'image/jpeg');
+            image.setAttribute('byteCount', '13');
+            const html = document.getElementById('html').cloneNode();
+            html.setAttribute('MediaType', 'html');
+            const svg = document.createElementNS('http://www.w3.org/2000/svg', 'svg:path').cloneNode();
+            svg.setAttribute('viewBox', '0 0 1 1');
+            return [root.namespaceURI, image.namespaceURI,
+                image.getAttribute('mediaType'), image.getAttribute('mediatype'),
+                image.getAttribute('byteCount'), image.getAttribute('bytecount'),
+                new XMLSerializer().serializeToString(root),
+                html.namespaceURI, html.getAttribute('mediatype'), html.attributes[1].name,
+                svg.namespaceURI, svg.getAttribute('viewBox'), svg.getAttribute('viewbox')];
+        })()"#).unwrap();
+        assert_eq!(result, serde_json::json!([
+            null, null, "image/jpeg", null, "13", null,
+            "<blocks><slide><image mediaType=\"image/jpeg\" byteCount=\"13\"></image></slide></blocks>",
+            "http://www.w3.org/1999/xhtml", "html", "mediatype",
+            "http://www.w3.org/2000/svg", "0 0 1 1", null
+        ]));
+    }
+
+    #[test]
     fn svg_path_uses_the_standard_interface_chain() {
         let mut rt = setup_runtime(
             r#"<html><body><svg><path id="shape" d="M0 0L1 1"></path></svg></body></html>"#,

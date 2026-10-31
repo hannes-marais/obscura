@@ -3711,11 +3711,11 @@ class Element extends Node {
     // instead of an SVGAnimatedString. An element's namespace never changes,
     // so cache it like _lname.
     if (this._nsCache !== undefined) return this._nsCache;
-    let ns = _domParse("namespace_uri", this._nid) || "";
-    // Nodes with no element name recorded fall back to the previous heuristic.
-    if (!ns) ns = this.localName === "svg" ? "http://www.w3.org/2000/svg" : "http://www.w3.org/1999/xhtml";
-    this._nsCache = ns;
-    return ns;
+    // An empty namespace is a real null namespace, not an unspecified HTML
+    // namespace. In particular cloneNode returns a fresh wrapper without the
+    // createElementNS `_ns` override, while the DOM retains the empty name.ns.
+    this._nsCache = _domParse("namespace_uri", this._nid) || null;
+    return this._nsCache;
   }
   // `inner_html` resolves a <template> to its contents document on the Rust
   // side (issue #463), so this needs no template special case.
