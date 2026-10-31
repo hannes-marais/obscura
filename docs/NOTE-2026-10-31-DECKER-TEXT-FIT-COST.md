@@ -22,3 +22,5 @@ The corrected callback probe recorded 26 samples with median layout-stage 74,149
 Updated: 2026-10-31
 
 Locate the excessive Taffy work by temporarily counting measurement callbacks by source compute-layout call site, gated by an opt-in environment variable. Keep all original calls, layout inputs, semantics and watchdog behavior; log only aggregate source line/count pairs. Compare the same asset-complete fixture, preserve its full twelve fitting rounds and remove the diagnostic after profiling. The result is not a fix or full-deck acceptance.
+
+The call-site probe (26 identical samples, no failed HTTP responses) attributes 64,098 callbacks to deferred-flex Layout and 31,383 to deferred-flex FitContent root reflow, versus 1,050 in initial root layout and 49 fit-content node measurements. Count the root-layout invocations as well to distinguish repeated outer calls from excessive work within one Taffy call. Preserve all calls and remove the probe after profiling; no layout optimization is yet validated.

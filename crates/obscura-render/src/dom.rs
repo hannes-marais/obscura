@@ -6928,6 +6928,7 @@ fn layout_dom_once(
             let profile_layout = std::env::var_os("OBSCURA_PROFILE_DECKER_LAYOUT").is_some();
             let profile_phase = std::cell::Cell::new(0usize);
             let profile_counts: [std::cell::Cell<usize>; 8192] = std::array::from_fn(|_| std::cell::Cell::new(0));
+            let profile_calls: [std::cell::Cell<usize>; 8192] = std::array::from_fn(|_| std::cell::Cell::new(0));
             let mut measure = |known: taffy::Size<Option<f32>>,
                                    avail: taffy::Size<taffy::AvailableSpace>,
                                    _node,
@@ -6945,7 +6946,11 @@ fn layout_dom_once(
                 };
             macro_rules! profile_compute {
                 ($tree:ident, $($args:tt)*) => {{
-                    if profile_layout { profile_phase.set(line!() as usize); }
+                    if profile_layout {
+                        let line = line!() as usize;
+                        profile_phase.set(line);
+                        if let Some(count) = profile_calls.get(line) { count.set(count.get() + 1); }
+                    }
                     $tree.compute_layout_with_measure($($args)*)
                 }};
             }
@@ -7602,7 +7607,10 @@ fn layout_dom_once(
                 let counts: Vec<_> = profile_counts.iter().enumerate()
                     .filter_map(|(line, count)| (count.get() > 0).then_some((line, count.get())))
                     .collect();
-                eprintln!("obscura-layout-sites {counts:?}");
+                let calls: Vec<_> = profile_calls.iter().enumerate()
+                    .filter_map(|(line, count)| (count.get() > 0).then_some((line, count.get())))
+                    .collect();
+                eprintln!("obscura-layout-sites {counts:?} calls={calls:?}");
             }
             sync_resolved_percentage_padding(
                 &taffy_tree,
