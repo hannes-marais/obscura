@@ -12,3 +12,5 @@ The asset-complete static replay naturally runs all 12 rounds for both frames: O
 Updated: 2026-10-31
 
 Further isolate the 78 ms preparation by temporarily measuring TextEngine construction and recursive layout-tree construction, plus total layout pass, using an explicit opt-in environment flag and aggregate durations/counts only. The test fixture is the previously captured, asset-complete synthetic Build DOM; do not log document content. Preserve behavior and apply no change to fitting or watchdog. Validate the measured build against the same fixture and remove the probe after measurement. The likely optimization remains unproven until phase timing and equivalence tests support it.
+
+The asset-complete release replay produced 26 samples: median TextEngine construction 3 microseconds and layout-tree construction 1,578 microseconds (411 nodes, 75 inline contexts); total fitting remained about 1 second per frame with no failed HTTP responses. Those phases do not explain the 78 ms refresh. Add opt-in aggregate timing around the Taffy measure callback and the overall layout stage, without changing execution or logging content, then replay the identical fixture.

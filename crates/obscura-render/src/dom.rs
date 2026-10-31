@@ -6934,15 +6934,24 @@ fn layout_dom_once(
                 width: taffy::AvailableSpace::Definite(initial_cb_width),
                 height: taffy::AvailableSpace::Definite(viewport.1),
             };
+            let measure_time = std::cell::Cell::new(0u128);
+            let measure_count = std::cell::Cell::new(0usize);
+            let layout_start = std::time::Instant::now();
             let mut measure = |known: taffy::Size<Option<f32>>,
                                    avail: taffy::Size<taffy::AvailableSpace>,
                                    _node,
                                    ctx: Option<&mut usize>,
                                    _style: &taffy::Style| {
-                    match ctx {
+                    let started = profile_layout.then(std::time::Instant::now);
+                    let result = match ctx {
                         Some(&mut idx) => engine.measure_taffy(idx, known, avail),
                         None => taffy::Size::ZERO,
+                    };
+                    if let Some(started) = started {
+                        measure_time.set(measure_time.get() + started.elapsed().as_micros());
+                        measure_count.set(measure_count.get() + 1);
                     }
+                    result
                 };
 
             #[cfg(feature = "paint")]
@@ -7592,6 +7601,10 @@ fn layout_dom_once(
                     );
                     let _ = taffy_tree.compute_layout_with_measure(taffy_root, available, &mut measure);
                 }
+            }
+            if profile_layout {
+                eprintln!("obscura-layout-measure layout_us={} measure_us={} measure_count={}",
+                    layout_start.elapsed().as_micros(), measure_time.get(), measure_count.get());
             }
             sync_resolved_percentage_padding(
                 &taffy_tree,
