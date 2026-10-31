@@ -9,28 +9,8 @@ use crate::RequestedAxis;
 
 /// The number of cache entries for each node in the tree
 const CACHE_SIZE: usize = 9;
-
-#[cfg(feature = "std")]
-mod temporary_cache_profile {
-    use std::sync::{OnceLock, atomic::{AtomicU64, Ordering}};
-    static ENABLED: OnceLock<bool> = OnceLock::new();
-    static HIT: AtomicU64 = AtomicU64::new(0);
-    static MISS: AtomicU64 = AtomicU64::new(0);
-    static STORE: AtomicU64 = AtomicU64::new(0);
-    static REPLACE: AtomicU64 = AtomicU64::new(0);
-    fn enabled() -> bool { *ENABLED.get_or_init(|| std::env::var_os("OBSCURA_PROFILE_TAFFY_CACHE").is_some()) }
-    pub fn hit() { if enabled() { HIT.fetch_add(1, Ordering::Relaxed); } }
-    pub fn miss() { if enabled() { MISS.fetch_add(1, Ordering::Relaxed); } }
-    pub fn store(replaced: bool) {
-        if !enabled() { return; }
-        if replaced { REPLACE.fetch_add(1, Ordering::Relaxed); }
-        let n = STORE.fetch_add(1, Ordering::Relaxed) + 1;
-        if n % 100_000 == 0 {
-            eprintln!("taffy-cache-profile stores={} hits={} misses={} replacements={}", n,
-                HIT.load(Ordering::Relaxed), MISS.load(Ordering::Relaxed), REPLACE.load(Ordering::Relaxed));
-        }
-    }
-}
+// Two bounded ways retain distinct inputs in the same coarse constraint bucket.
+const CACHE_WAYS: usize = 2;
 
 // Manually written-out results of float to u32 bit casts because
 // `f32::to_bits` is not yet const at our MSRV.
@@ -201,7 +181,8 @@ pub struct Cache {
     /// The cache entry for the node's final layout
     final_layout_entry: Option<CacheEntry<LayoutOutput>>,
     /// The cache entries for the node's preliminary size measurements
-    measure_entries: [Option<CacheEntry<MeasureOutput>>; CACHE_SIZE],
+    measure_entries: [Option<CacheEntry<MeasureOutput>>; CACHE_SIZE * CACHE_WAYS],
+    measure_next_way: [u8; CACHE_SIZE],
     /// Tracks if all cache entries are empty
     is_empty: bool,
 }
@@ -215,7 +196,7 @@ impl Default for Cache {
 impl Cache {
     /// Create a new empty cache
     pub const fn new() -> Self {
-        Self { final_layout_entry: None, measure_entries: [None; CACHE_SIZE], is_empty: true }
+        Self { final_layout_entry: None, measure_entries: [None; CACHE_SIZE * CACHE_WAYS], measure_next_way: [0; CACHE_SIZE], is_empty: true }
     }
 
     /// Return the cache slot to cache the current computed result in
@@ -295,14 +276,10 @@ impl Cache {
                         && entry.content.vertical_margins_are_collapsible
                             == vertical_margin_context_key(input)
                     {
-                        #[cfg(feature = "std")]
-                        temporary_cache_profile::hit();
                         return Some(entry.content.into_layout_output());
                     }
                 }
 
-                #[cfg(feature = "std")]
-                temporary_cache_profile::miss();
                 None
             }
             RunMode::PerformHiddenLayout => None,
@@ -319,11 +296,19 @@ impl Cache {
             }
             RunMode::ComputeSize => {
                 self.is_empty = false;
-                let cache_slot = Self::compute_cache_slot(input.known_dimensions, input.available_space);
-                #[cfg(feature = "std")]
-                temporary_cache_profile::store(self.measure_entries[cache_slot].is_some_and(|entry|
-                    entry.key != key || entry.content.vertical_margins_are_collapsible != vertical_margin_context_key(input)));
-                self.measure_entries[cache_slot] =
+                let bucket = Self::compute_cache_slot(input.known_dimensions, input.available_space);
+                let base = bucket * CACHE_WAYS;
+                let margin_context = vertical_margin_context_key(input);
+                let way = (0..CACHE_WAYS).find(|&way| {
+                    self.measure_entries[base + way].is_some_and(|entry|
+                        entry.key == key && entry.content.vertical_margins_are_collapsible == margin_context)
+                }).or_else(|| (0..CACHE_WAYS).find(|&way| self.measure_entries[base + way].is_none()))
+                    .unwrap_or_else(|| {
+                        let way = self.measure_next_way[bucket] as usize;
+                        self.measure_next_way[bucket] = ((way + 1) % CACHE_WAYS) as u8;
+                        way
+                    });
+                self.measure_entries[base + way] =
                     Some(CacheEntry { key, content: MeasureOutput::new(input, layout_output) });
             }
             RunMode::PerformHiddenLayout => {}
@@ -337,7 +322,8 @@ impl Cache {
         }
         self.is_empty = true;
         self.final_layout_entry = None;
-        self.measure_entries = [None; CACHE_SIZE];
+        self.measure_entries = [None; CACHE_SIZE * CACHE_WAYS];
+        self.measure_next_way = [0; CACHE_SIZE];
         ClearState::Cleared
     }
 

@@ -18061,6 +18061,29 @@ mod tests {
     }
 
     #[test]
+    fn taffy_measure_cache_keeps_colliding_constraints_and_clears() {
+        use taffy::tree::{Cache, LayoutInput, LayoutOutput, RunMode};
+        let mut cache = Cache::new();
+        let mut first = LayoutInput::HIDDEN;
+        first.run_mode = RunMode::ComputeSize;
+        first.known_dimensions.width = Some(10.0);
+        let mut second = first;
+        second.known_dimensions.width = Some(20.0);
+        let one = LayoutOutput::from_outer_size(taffy::Size { width: 10.0, height: 1.0 });
+        let two = LayoutOutput::from_outer_size(taffy::Size { width: 20.0, height: 2.0 });
+        cache.store(&first, one);
+        cache.store(&second, two);
+        assert_eq!(cache.get(&first).unwrap().size, one.size);
+        assert_eq!(cache.get(&second).unwrap().size, two.size);
+        let mut different_margins = first;
+        different_margins.vertical_margins_are_collapsible.start = true;
+        assert!(cache.get(&different_margins).is_none());
+        cache.clear();
+        assert!(cache.get(&first).is_none());
+        assert!(cache.get(&second).is_none());
+    }
+
+    #[test]
     fn retained_preflights_share_cssom_rules_with_full_layout() {
         let tree = parse_html("<style id=sheet>#target { width: 80px }</style><p id=target>text</p><img id=image>");
         let owner = tree.get_element_by_id("sheet").unwrap();
