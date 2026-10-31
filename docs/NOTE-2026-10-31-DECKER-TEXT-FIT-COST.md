@@ -8,3 +8,7 @@ Identify which phases of resource-aware retained layout cost time before choosin
 
 Updated: 2026-10-31
 The asset-complete static replay naturally runs all 12 rounds for both frames: Obscura 1,018 and 1,013 ms, Chromium 4.7 and 2.9 ms. Native phase instrumentation on 26 preparations measured median 0.11 ms image collection, 77.56 ms layout, and 78.28 ms through derived geometry. Existing telemetry reports a stylesheet cache hit but retained-style fallback and ~4 ms cascade. Evidence `textfit-static-release-assets`, `textfit-static-chromium`, and `obscura-layout-detailed.log`. Instrumentation was removed after the measurement. The dominant remaining cost is layout/shaping; no performance fix or real Build pass is claimed.
+
+Updated: 2026-10-31
+
+Further isolate the 78 ms preparation by temporarily measuring TextEngine construction and recursive layout-tree construction, plus total layout pass, using an explicit opt-in environment flag and aggregate durations/counts only. The test fixture is the previously captured, asset-complete synthetic Build DOM; do not log document content. Preserve behavior and apply no change to fitting or watchdog. Validate the measured build against the same fixture and remove the probe after measurement. The likely optimization remains unproven until phase timing and equivalence tests support it.
