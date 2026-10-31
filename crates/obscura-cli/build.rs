@@ -1,4 +1,6 @@
 use std::env;
+use std::path::Path;
+use std::process::Command;
 
 fn env_value(name: &str) -> Option<String> {
     env::var(name)
@@ -40,11 +42,32 @@ fn local_version() -> String {
     }
 }
 
+fn watch_git_revision() {
+    let git_path = |name: &str| {
+        Command::new("git").args(["rev-parse", "--git-path", name]).output().ok()
+            .filter(|out| out.status.success())
+            .and_then(|out| String::from_utf8(out.stdout).ok())
+            .map(|path| path.trim().to_owned())
+            .filter(|path| !path.is_empty())
+    };
+    let symbolic_ref = Command::new("git").args(["symbolic-ref", "-q", "HEAD"]).output().ok()
+        .filter(|out| out.status.success())
+        .and_then(|out| String::from_utf8(out.stdout).ok())
+        .map(|name| name.trim().to_owned())
+        .filter(|name| !name.is_empty());
+    for name in [Some("HEAD"), symbolic_ref.as_deref(), Some("packed-refs")].into_iter().flatten() {
+        if let Some(path) = git_path(name).filter(|path| Path::new(path).exists()) {
+            println!("cargo:rerun-if-changed={path}");
+        }
+    }
+}
+
 fn main() {
     println!("cargo:rerun-if-env-changed=OBSCURA_VERSION");
     println!("cargo:rerun-if-env-changed=GITHUB_REF_TYPE");
     println!("cargo:rerun-if-env-changed=GITHUB_REF_NAME");
     println!("cargo:rerun-if-env-changed=GITHUB_REF");
+    watch_git_revision();
 
     let version = env_value("OBSCURA_VERSION")
         .map(normalize_version)
