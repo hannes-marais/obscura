@@ -8,3 +8,5 @@ Add rerun dependencies for the Git HEAD file, the active symbolic ref when prese
 
 Updated: 2026-10-31
 Direct build-script checks pass for HEAD and branch dependency paths, current revision, explicit and tagged overrides, and no-Git fallback. A real sequential Anvil rebuild across a ref advance remains required.
+
+The first Anvil fdevbox build admitted commit `f707e93` and the executable reports `0.1.0-dev+f707e93`. A second build after this note-only commit will check that Cargo updates the revision without a source edit to the CLI or cache removal.
