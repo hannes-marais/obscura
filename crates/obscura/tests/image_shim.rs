@@ -149,3 +149,52 @@ async fn invalid_image_bytes_emit_error_like_chromium() {
         "invalid image bytes must fail instead of being treated as a decoded image"
     );
 }
+
+/// MAW mounts Block HTML through `template.innerHTML` and attaches an `error`
+/// listener before inserting the fragment. Images in template contents
+/// belong to an inert document and must not load (or fail) until inserted.
+#[cfg(feature = "render")]
+#[tokio::test]
+async fn template_image_loads_only_after_insertion() {
+    std::env::set_var("OBSCURA_ALLOW_PRIVATE_NETWORK", "1");
+    let base = spawn_server(
+        r#"<!doctype html><html><body><div id="r">waiting</div><div id="mount"></div>
+<script>
+  var events = [];
+  function mounted(id) {
+    var template = document.createElement('template');
+    template.innerHTML = '<p><img id="' + id + '" src="/pixel.png" alt=""></p>';
+    var img = template.content.querySelector('img');
+    img.addEventListener('error', function () { events.push(id + ':error'); }, { once: true });
+    img.addEventListener('load', function () { events.push(id + ':load'); }, { once: true });
+    return template.content;
+  }
+  var kept = mounted('kept');
+  setTimeout(function () {
+    document.getElementById('mount').appendChild(mounted('inserted'));
+  }, 50);
+  setTimeout(function () {
+    document.getElementById('r').textContent = 'events=' + events.join(',');
+  }, 1500);
+</script>
+</body></html>"#,
+    );
+
+    let browser = Browser::new().unwrap();
+    let mut page = browser.new_page().await.unwrap();
+    page.goto(&base).await.unwrap();
+    for _ in 0..10 {
+        page.settle(500).await;
+        let text = page.evaluate("document.getElementById('r').textContent");
+        if text.as_str().unwrap_or("").starts_with("events=") {
+            break;
+        }
+    }
+
+    let text = page.evaluate("document.getElementById('r').textContent");
+    assert_eq!(
+        text.as_str().unwrap_or(""),
+        "events=inserted:load",
+        "a template image must not fail before insertion, and must load once inserted"
+    );
+}

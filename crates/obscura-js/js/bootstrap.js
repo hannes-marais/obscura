@@ -2309,7 +2309,29 @@ function __prepareInsertedScript(script) {
   }
 }
 
+// Is node inside a <template>'s contents fragment?
+function _inTemplateContents(node) {
+  for (let n = node; n; n = n.parentNode) {
+    if (n instanceof DocumentFragment && n._fragmentContext === 'template') return true;
+  }
+  return false;
+}
+
+// Images deferred while in template contents load once inserted elsewhere.
+function _resumeDeferredImages(root) {
+  if (!root || root.nodeType !== 1) return;
+  const images = root.tagName === 'IMG' ? [root] : [];
+  for (const nid of _domParse("query_selector_all_scoped", root._nid, "img") || []) {
+    const image = _wrapEl(+nid);
+    if (image && image !== root) images.push(image);
+  }
+  for (const image of images) {
+    if (image._imageDeferredInert) image._queueImageRequest();
+  }
+}
+
 function __prepareInsertedSubtree(root) {
+  _resumeDeferredImages(root);
   // HTML's script preparation algorithm leaves a disconnected script
   // unstarted.  When an ancestor is later connected, insertion steps visit
   // every script in that subtree in tree order.
@@ -6822,6 +6844,13 @@ class HTMLImageElement extends Element {
 
   _queueImageRequest() {
     if (this._imageQueued || this._imageComplete) return;
+    // Template contents are an inert document: their images neither load nor
+    // fail until inserted (HTML adopting steps); insertion re-queues them.
+    if (_inTemplateContents(this)) {
+      this._imageDeferredInert = true;
+      return;
+    }
+    this._imageDeferredInert = false;
     this._imageQueued = true;
     const request = this._imageRequest;
     setTimeout(() => {
