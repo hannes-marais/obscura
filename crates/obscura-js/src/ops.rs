@@ -40,7 +40,11 @@ pub enum InterceptResolution {
         url: Option<String>,
         method: Option<String>,
         headers: Option<HashMap<String, String>>,
-        body: Option<String>,
+        /// Already-decoded request body. Bytes rather than `String`: a POST the
+        /// client rewrites may be a protobuf, a gzip stream or a multipart part,
+        /// and passing those through `String` replaces every non-UTF-8 sequence
+        /// with U+FFFD before they reach the wire.
+        body: Option<Vec<u8>>,
     },
     Fulfill {
         status: u16,
@@ -80,9 +84,10 @@ pub struct StoredNetworkResponseBody {
 /// it. Static navigation subresources go through Page::record_network_event;
 /// this is the parallel channel for script-initiated requests, which run in the
 /// V8 op layer and would otherwise never surface as CDP Network events (#406).
+/// ES-module graph responses share this queue through the module loader.
 #[derive(Debug, Clone)]
 pub struct JsNetworkEvent {
-    /// Matches the `fetch-{N}` id under which the body is stored, so CDP
+    /// Matches the request id under which the body is stored, so CDP
     /// Network.getResponseBody resolves for the same request.
     pub request_id: String,
     /// The interception consumer already received the request start.
@@ -340,15 +345,23 @@ pub struct ObscuraState {
     pub dialog_handler: Option<crate::dialog::DialogHandler>,
     pub dom: Option<DomTree>,
     pub url: String,
-    /// Initial about:blank documents retain their creator's base URL and origin.
+    /// Initial about:blank and srcdoc documents retain their creator's base and origin.
     pub(crate) about_base_url: Option<String>,
     pub(crate) inherited_origin: Option<String>,
+    pub(crate) scripting_enabled: bool,
+    pub(crate) sandbox_opaque_origin: bool,
     storage_origin_cache: RefCell<StorageOriginCache>,
     /// WHATWG canonical name of the document's character encoding (e.g.
     /// "UTF-8", "EUC-JP"). Backs `document.characterSet` and the URL query
     /// encoding override for `<a>`/`<area>` hrefs in legacy-charset documents.
     pub encoding: String,
+    /// MIME type of the document's main resource, lowercased and without
+    /// parameters. Backs `document.contentType`; a `text/plain` navigation
+    /// must not report `text/html` just because the URL has no extension.
+    pub content_type: String,
     pub title: String,
+    /// (reduced motion, dark scheme), shared by every document in this page.
+    pub(crate) media_preferences: Rc<Cell<(bool, bool)>>,
     /// URL of the document that initiated this document's navigation. Direct
     /// browser/API navigations leave this empty; document-initiated
     /// navigations set it to the source document URL.
@@ -387,6 +400,9 @@ pub struct ObscuraState {
     pub pending_history_traversal: Option<usize>,
     pub intercept_tx: Option<tokio::sync::mpsc::UnboundedSender<InterceptedRequest>>,
     pub intercept_enabled: bool,
+    /// `Fetch.enable` URL patterns. Only matching fetch()/XHR requests are
+    /// sent to the interception channel; empty means every request.
+    pub intercept_url_patterns: Vec<String>,
     pub intercept_page_id: String,
     // Queue of (binding_name, payload) calls made by page JS via the
     // `op_binding_called` op. Drained by the CDP layer after each dispatch
@@ -478,12 +494,13 @@ pub struct ObscuraState {
     /// relayout of the same document reuses it without refetching.
     #[cfg(feature = "render")]
     pub render_resources: obscura_render::RenderResourceCache,
-    /// Waiters sharing an asynchronous HTMLImageElement request. The key keeps
+    /// Cancellation handle and waiters sharing an HTMLImageElement request. The key keeps
     /// navigation identity and request credentials separate so neither stale
     /// pages nor incompatible CORS profiles share a completion.
     #[cfg(feature = "render")]
     pub render_image_in_flight:
-        HashMap<(u64, String, ImageRequestProfile), Vec<tokio::sync::oneshot::Sender<()>>>,
+        HashMap<(u64, String, ImageRequestProfile),
+            (tokio::sync::oneshot::Sender<()>, Vec<tokio::sync::oneshot::Sender<()>>)>,
     /// Page-transport loads for resources that cache-only layout or paint
     /// missed. The owning page fetches them and sends the outcome here; the
     /// runtime applies results at its own event-loop turns and at every
@@ -523,6 +540,8 @@ pub struct ObscuraState {
     /// parsing/indexing when ordered CSS source and viewport remain identical.
     #[cfg(feature = "render")]
     pub stylesheet_cache: obscura_render::StylesheetCache,
+    #[cfg(feature = "render")]
+    pub(crate) style_query_cache: Option<StyleQueryCache>,
     /// Script-created faces in this document's `FontFaceSet`. This is separate
     /// from the DOM so the bridge does not manufacture a selector-visible
     /// `<style>` element merely to feed the renderer.
@@ -597,6 +616,12 @@ pub struct PendingFrameMessage {
 
 impl ObscuraState {
     pub(crate) fn inherit_resources(&mut self, parent: &Self) {
+        self.media_preferences = parent.media_preferences.clone();
+        #[cfg(feature = "render")]
+        {
+            let (reduce, dark) = parent.media_preferences.get();
+            self.render_media = self.render_media.with_reduced_motion(reduce).with_dark_color_scheme(dark);
+        }
         self.cookie_jar = parent.cookie_jar.clone();
         // A frame shares its page's Web Storage Arcs. The ops key by the frame
         // realm's own document URL, so a cross-origin frame still lands in its
@@ -628,9 +653,13 @@ impl ObscuraState {
             url: "about:blank".to_string(),
             about_base_url: None,
             inherited_origin: None,
+            scripting_enabled: true,
+            sandbox_opaque_origin: false,
             storage_origin_cache: RefCell::new(StorageOriginCache { origin: "null".into(), ..Default::default() }),
             encoding: "UTF-8".to_string(),
+            content_type: String::new(),
             title: String::new(),
+            media_preferences: Rc::new(Cell::new((false, false))),
             referrer: String::new(),
             navigation_timing: NavigationTiming::default(),
             blocked_urls: Vec::new(),
@@ -649,6 +678,7 @@ impl ObscuraState {
             dialog_handler: None,
             intercept_tx: None,
             intercept_enabled: false,
+            intercept_url_patterns: Vec::new(),
             intercept_page_id: String::new(),
             pending_binding_calls: Vec::new(),
             pending_runtime_events: VecDeque::new(),
@@ -713,6 +743,8 @@ impl ObscuraState {
             render_resource_backlog: Vec::new(),
             #[cfg(feature = "render")]
             stylesheet_cache: obscura_render::StylesheetCache::default(),
+            #[cfg(feature = "render")]
+            style_query_cache: None,
             #[cfg(feature = "render")]
             dynamic_fonts: Vec::new(),
             #[cfg(feature = "render")]
@@ -881,12 +913,20 @@ fn record_js_network_completion(
     let state_borrow = state.borrow();
     let gs = state_borrow.borrow::<SharedState>().clone();
     let mut gs = gs.borrow_mut();
+    record_network_completion(&mut gs, event, || StoredNetworkResponseBody {
+        body: body.to_string(), base64_encoded,
+    });
+}
+
+pub(crate) fn record_network_completion(
+    gs: &mut ObscuraState,
+    event: JsNetworkEvent,
+    body: impl FnOnce() -> StoredNetworkResponseBody,
+) {
     let max_entries = response_body_entry_limit();
     let max_bytes = response_body_byte_limit();
     if max_entries > 0 && max_bytes > 0 && event.body_size <= max_bytes {
-        gs.network_response_bodies.insert(event.request_id.clone(), StoredNetworkResponseBody {
-            body: body.to_string(), base64_encoded,
-        });
+        gs.network_response_bodies.insert(event.request_id.clone(), body());
         gs.network_response_body_order.push_back(event.request_id.clone());
         while gs.network_response_body_order.len() > max_entries {
             if let Some(oldest) = gs.network_response_body_order.pop_front() {
@@ -894,7 +934,7 @@ fn record_js_network_completion(
             }
         }
     }
-    push_js_network_event(&mut gs, event);
+    push_js_network_event(gs, event);
 }
 
 fn push_js_network_event(gs: &mut ObscuraState, mut event: JsNetworkEvent) {
@@ -929,12 +969,12 @@ fn push_js_network_event(gs: &mut ObscuraState, mut event: JsNetworkEvent) {
 pub(crate) fn record_module_completion(
     gs: &mut ObscuraState, document_url: &str, navigation_origin: std::time::Instant,
     started: std::time::Instant, requested_url: &str, response: Option<&Response>, error: Option<String>,
-) {
+) -> bool {
     // A completion from a replaced document must not populate the new realm.
     // History/hash navigation keeps this clock: comparing full URLs loses
     // later lazy-module measurements on ordinary SPA route changes.
     if gs.navigation_timing.origin != navigation_origin ||
-        request_origin(&gs.url) != request_origin(document_url) { return; }
+        request_origin(&gs.url) != request_origin(document_url) { return false; }
     static MODULE_REQUEST: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
     let request_id = format!("module-{}", MODULE_REQUEST.fetch_add(1, std::sync::atomic::Ordering::Relaxed));
     let millis = |at: std::time::Instant| at.saturating_duration_since(navigation_origin).as_secs_f64() * 1_000.0;
@@ -950,29 +990,26 @@ pub(crate) fn record_module_completion(
         status_allowed: response.is_some(), from_cache,
     });
     let body_size = response.map(|response| response.body.len()).unwrap_or(0);
-    if body_size <= response_body_byte_limit() && response_body_entry_limit() > 0 {
-        if let Some(response) = response {
-            gs.network_response_bodies.insert(request_id.clone(), StoredNetworkResponseBody {
-                body: String::from_utf8_lossy(&response.body).into_owned(), base64_encoded: false,
-            });
-            gs.network_response_body_order.push_back(request_id.clone());
-            while gs.network_response_body_order.len() > response_body_entry_limit() {
-                if let Some(oldest) = gs.network_response_body_order.pop_front() { gs.network_response_bodies.remove(&oldest); }
-            }
-        }
-    }
-    push_js_network_event(gs, JsNetworkEvent {
+    let event = JsNetworkEvent {
         request_id, intercepted: false,
         url: response.map(|response| response.url.as_str()).unwrap_or(requested_url).into(),
         method: "GET".into(), resource_type: "Script".into(),
         status: response.map(|response| response.status).unwrap_or(0),
         response_headers: response.map(|response| response.headers.clone()).unwrap_or_default(),
         body_size,
-        // Unknown and cached physical transfers are zero, never decoded bytes.
         encoded_data_length: Some(if from_cache { 0 } else { metrics.and_then(|metrics| metrics.encoded_body_size).unwrap_or(0) }),
         timestamp: std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_secs_f64(),
         error_text: error,
-    });
+    };
+    if let Some(response) = response {
+        record_network_completion(gs, event, || match std::str::from_utf8(&response.body) {
+            Ok(body) => StoredNetworkResponseBody { body: body.to_string(), base64_encoded: false },
+            Err(_) => StoredNetworkResponseBody { body: BASE64.encode(&response.body), base64_encoded: true },
+        });
+    } else {
+        push_js_network_event(gs, event);
+    }
+    true
 }
 
 fn resource_response(
@@ -1065,10 +1102,10 @@ fn op_abort_signal_state<'s, 'i>(
 
 /// Dropping a request at any await boundary must emit one failure, including
 /// when cancelling the header future or the separately owned response body.
-struct FetchNetworkGuard {
-    state: std::rc::Weak<RefCell<ObscuraState>>,
-    event: Option<JsNetworkEvent>,
-    cancel: Option<Rc<CancelHandle>>,
+pub(crate) struct FetchNetworkGuard {
+    pub(crate) state: std::rc::Weak<RefCell<ObscuraState>>,
+    pub(crate) event: Option<JsNetworkEvent>,
+    pub(crate) cancel: Option<Rc<CancelHandle>>,
 }
 
 // reqwest's Display omits the cause (TLS, DNS, timeout, connection reset).
@@ -1182,6 +1219,7 @@ pub type SharedState = Rc<RefCell<ObscuraState>>;
 pub struct RealmStates {
     entries: Vec<(v8::Global<v8::Context>, u32, SharedState)>,
     frame_timers: HashMap<u32, FrameTimers>,
+    pub(crate) frame_preload_scripts: Vec<String>,
 }
 
 struct FrameTimers {
@@ -1239,7 +1277,7 @@ impl RealmStates {
         }).owner = Some((Rc::downgrade(parent), node, generation));
     }
 
-    fn frame_timers_active(&self, mut frame_id: u32) -> Option<bool> {
+    pub(crate) fn frame_timers_active(&self, mut frame_id: u32) -> Option<bool> {
         // A child document is active only while all of its owners are active.
         // Keep the walk bounded even if an invalid frame-parent chain arrives.
         for _ in 0..=self.frame_timers.len() {
@@ -1309,6 +1347,16 @@ impl RealmStates {
             }
         }
         removed
+    }
+
+    pub(crate) fn has_pending_navigation(&self) -> bool {
+        self.entries.iter().any(|(_, _, state)| state.borrow().pending_navigation.is_some())
+    }
+
+    pub(crate) fn take_pending_navigations(&self) -> Vec<(u32, String, String, String)> {
+        self.entries.iter().filter_map(|(_, id, state)| {
+            state.borrow_mut().pending_navigation.take().map(|(url, method, body)| (*id, url, method, body))
+        }).collect()
     }
 
     pub(crate) fn by_frame_id(&self, frame_id: u32) -> Option<SharedState> {
@@ -1427,12 +1475,12 @@ fn render_mutation_impact(
             let Some((name, value)) = arg2.split_once('\0') else {
                 return RenderMutationImpact::default();
             };
-            let old = dom
-                .with_node(target, |node| node.get_attribute(name).map(str::to_owned))
-                .flatten();
+            let actual_change = dom
+                .with_node(target, |node| node.get_attribute(name) != Some(value))
+                .unwrap_or(true);
             RenderMutationImpact {
                 connected: node_is_connected(dom, target),
-                actual_change: old.as_deref() != Some(value),
+                actual_change,
             }
         }
         "set_attribute_ns" => {
@@ -1447,14 +1495,12 @@ fn render_mutation_impact(
                 .split_once(':')
                 .map(|(_, local)| local)
                 .unwrap_or(qualified);
-            let old = dom
-                .with_node(target, |node| {
-                    node.get_attribute_ns(namespace, local).map(str::to_owned)
-                })
-                .flatten();
+            let actual_change = dom
+                .with_node(target, |node| node.get_attribute_ns(namespace, local) != Some(value))
+                .unwrap_or(true);
             RenderMutationImpact {
                 connected: node_is_connected(dom, target),
-                actual_change: old.as_deref() != Some(value),
+                actual_change,
             }
         }
         "remove_attribute" => {
@@ -1488,12 +1534,13 @@ fn render_mutation_impact(
             let (Some(parent), Some(child)) = (node(arg1), node(arg2)) else {
                 return RenderMutationImpact::default();
             };
-            if dom.get_node(parent).is_none() || dom.get_node(child).is_none() {
+            let (Some(()), Some(old_parent)) =
+                (dom.with_node(parent, |_| ()), dom.with_node(child, |node| node.parent))
+            else {
                 return RenderMutationImpact::default();
-            }
-            let old_parent = dom.get_node(child).and_then(|node| node.parent);
-            let already_last =
-                old_parent == Some(parent) && dom.children(parent).last().copied() == Some(child);
+            };
+            let already_last = old_parent == Some(parent)
+                && dom.with_node(parent, |node| node.last_child) == Some(Some(child));
             RenderMutationImpact {
                 // Moving a connected node into a detached subtree removes its
                 // old box, while attaching a detached node creates a new one.
@@ -1507,23 +1554,23 @@ fn render_mutation_impact(
             };
             RenderMutationImpact {
                 connected: node_is_connected(dom, child),
-                actual_change: dom.get_node(child).and_then(|node| node.parent).is_some(),
+                actual_change: dom.with_node(child, |node| node.parent.is_some()).unwrap_or(false),
             }
         }
         "insert_before" => {
             let (Some(new_node), Some(reference)) = (node(arg1), node(arg2)) else {
                 return RenderMutationImpact::default();
             };
-            if dom.get_node(new_node).is_none() {
+            if dom.with_node(new_node, |_| ()).is_none() {
                 return RenderMutationImpact::default();
             }
-            let Some(reference_parent) = dom.get_node(reference).and_then(|node| node.parent)
+            let Some((Some(reference_parent), reference_prev)) =
+                dom.with_node(reference, |node| (node.parent, node.prev_sibling))
             else {
                 return RenderMutationImpact::default();
             };
             let new_was_connected = node_is_connected(dom, new_node);
-            let already_immediately_before =
-                dom.get_node(reference).and_then(|node| node.prev_sibling) == Some(new_node);
+            let already_immediately_before = reference_prev == Some(new_node);
             RenderMutationImpact {
                 connected: node_is_connected(dom, reference_parent) || new_was_connected,
                 actual_change: new_node != reference && (!already_immediately_before
@@ -1538,7 +1585,7 @@ fn render_mutation_impact(
                 connected: node_is_connected(dom, target),
                 // Parsing normalizes source text, so a cheap string comparison
                 // cannot prove equality. Connected replacement remains dirty.
-                actual_change: dom.get_node(target).is_some(),
+                actual_change: dom.with_node(target, |_| ()).is_some(),
             }
         }
         "set_text_content" => {
@@ -1643,8 +1690,8 @@ fn retained_style_mutation(
         }
         "append_child" => {
             let child = NodeId::new(arg2.parse::<u32>().ok()?);
-            dom.get_node(node)?;
-            let old_parent = dom.get_node(child)?.parent;
+            dom.with_node(node, |_| ())?;
+            let old_parent = dom.with_node(child, |node| node.parent)?;
             Some(
                 obscura_render::TreeStyleMutation::Insert {
                     node: child,
@@ -1655,16 +1702,16 @@ fn retained_style_mutation(
             )
         }
         "remove_child" => {
-            let old_parent = dom.get_node(node)?.parent?;
+            let old_parent = dom.with_node(node, |node| node.parent)??;
             Some(obscura_render::TreeStyleMutation::Remove { node, old_parent }.into())
         }
         "insert_before" => {
             let reference = NodeId::new(arg2.parse::<u32>().ok()?);
-            let new_parent = dom.get_node(reference)?.parent?;
+            let new_parent = dom.with_node(reference, |node| node.parent)??;
             if dom.containing_shadow_root(new_parent).is_some() {
                 return None;
             }
-            let old_parent = dom.get_node(node)?.parent;
+            let old_parent = dom.with_node(node, |node| node.parent)?;
             Some(
                 obscura_render::TreeStyleMutation::Insert {
                     node,
@@ -1674,18 +1721,20 @@ fn retained_style_mutation(
                 .into(),
             )
         }
-        "set_text_content" => match &dom.get_node(node)?.data {
-            NodeData::Text { .. } => Some(
+        "set_text_content" => match dom
+            .with_node(node, |node| matches!(node.data, NodeData::Text { .. }).then_some(node.parent))?
+        {
+            Some(parent) => Some(
                 obscura_render::TreeStyleMutation::Text {
                     node,
-                    parent: dom.get_node(node)?.parent,
+                    parent,
                 }
                 .into(),
             ),
             // Element/fragment textContent replaces a child list. That can
             // flip :empty and structural/relational selectors, so the local
             // text fast path cannot describe the mutation safely.
-            _ => None,
+            None => None,
         },
         _ => None,
     }
@@ -1952,13 +2001,18 @@ fn op_script_try_start(state: &OpState, nid: u32) -> bool {
 /// tree. Layout intentionally remains unaware of the detached root until
 /// scoped style, slot assignment, and composed-tree paint are implemented.
 #[op2(fast)]
-fn op_shadow_attach(state: &OpState, host_nid: u32, #[string] mode: String) -> i32 {
+fn op_shadow_attach(
+    state: &OpState,
+    host_nid: u32,
+    #[string] mode: String,
+    frame_id: u32,
+) -> i32 {
     let mode = match mode.as_str() {
         "open" => ShadowRootMode::Open,
         "closed" => ShadowRootMode::Closed,
         _ => return -1,
     };
-    let shared = state.borrow::<SharedState>().clone();
+    let shared = frame_state(state, frame_id);
     let state = shared.borrow();
     let Some(dom) = state.dom.as_ref() else {
         return -1;
@@ -1975,8 +2029,8 @@ fn op_shadow_attach(state: &OpState, host_nid: u32, #[string] mode: String) -> i
 /// visibility in bootstrap.js.
 #[op2]
 #[string]
-fn op_shadow_root_info(state: &OpState, host_nid: u32) -> String {
-    let shared = state.borrow::<SharedState>().clone();
+fn op_shadow_root_info(state: &OpState, host_nid: u32, frame_id: u32) -> String {
+    let shared = frame_state(state, frame_id);
     let state = shared.borrow();
     let Some(dom) = state.dom.as_ref() else {
         return String::new();
@@ -2147,6 +2201,14 @@ fn op_external_stylesheet_get(state: &OpState, owner_nid: u32, frame_id: u32) ->
     serde_json::json!({ "originClean": true, "css": css }).to_string()
 }
 
+fn window_named_attributes(node: &obscura_dom::tree::Node) -> [Option<&str>; 2] {
+    let Some(tag) = node.as_element() else { return [None, None] };
+    let name = (tag.ns.as_ref() == "http://www.w3.org/1999/xhtml"
+        && matches!(tag.local.as_ref(), "embed" | "form" | "iframe" | "img" | "object"))
+        .then(|| node.get_attribute_ns("", "name")).flatten();
+    [node.get_attribute_ns("", "id"), name].map(|value| value.filter(|value| !value.is_empty()))
+}
+
 #[op2]
 #[string]
 fn op_dom(
@@ -2194,6 +2256,13 @@ fn op_dom_inner(shared: SharedState, cmd: String, arg1: String, arg2: String) ->
     if cmd == "performance_resource_entries" {
         return serde_json::to_string(&std::mem::take(&mut shared.borrow_mut().resource_timing_entries))
             .unwrap_or_else(|_| "[]".into());
+    }
+
+    if cmd == "prefers_reduced_motion" {
+        return shared.borrow().media_preferences.get().0.to_string();
+    }
+    if cmd == "prefers_dark" {
+        return shared.borrow().media_preferences.get().1.to_string();
     }
     if cmd == "performance_time_origin" {
         return shared.borrow().navigation_timing.time_origin.to_string();
@@ -2289,21 +2358,6 @@ fn op_dom_inner(shared: SharedState, cmd: String, arg1: String, arg2: String) ->
             .as_ref()
             .map(|dom| render_mutation_impact(dom, &cmd, &arg1, &arg2))
             .unwrap_or_default();
-        #[cfg(feature = "render")]
-        let keep_inline_style_values = state.prepared_render.is_some();
-        #[cfg(feature = "render")]
-        let retained_style_mutation = state
-            .dom
-            .as_ref()
-            .and_then(|dom| {
-                retained_style_mutation(
-                    dom,
-                    &cmd,
-                    &arg1,
-                    &arg2,
-                    keep_inline_style_values,
-                )
-            });
         let invalidate = impact.connected && impact.actual_change;
         if invalidate {
             state.activity_generation = state.activity_generation.wrapping_add(1);
@@ -2315,6 +2369,14 @@ fn op_dom_inner(shared: SharedState, cmd: String, arg1: String, arg2: String) ->
         // state is deliberately excluded because `:checked` can affect style.
         let invalidate_geometry =
             invalidate && !matches!(cmd.as_str(), "set_form_value" | "set_form_indeterminate");
+        #[cfg(feature = "render")]
+        let retained_style_mutation = if invalidate_geometry && state.prepared_render.is_some() {
+            state.dom.as_ref().and_then(|dom| {
+                retained_style_mutation(dom, &cmd, &arg1, &arg2, true)
+            })
+        } else {
+            None
+        };
         #[cfg(feature = "render")]
         if !reset_nodes.is_empty() {
             state
@@ -2365,12 +2427,12 @@ fn op_dom_inner(shared: SharedState, cmd: String, arg1: String, arg2: String) ->
                     .parse::<u32>()
                     .ok()
                     .map(NodeId::new)
-                    .and_then(|reference| state.dom.as_ref()?.get_node(reference)?.parent),
+                    .and_then(|reference| state.dom.as_ref()?.with_node(reference, |node| node.parent).flatten()),
                 "remove_child" => arg1
                     .parse::<u32>()
                     .ok()
                     .map(NodeId::new)
-                    .and_then(|child| state.dom.as_ref()?.get_node(child)?.parent),
+                    .and_then(|child| state.dom.as_ref()?.with_node(child, |node| node.parent).flatten()),
                 "set_inner_html" | "set_inner_html_context" | "set_text_content" => {
                     arg1.parse::<u32>().ok().map(NodeId::new)
                 }
@@ -2445,6 +2507,34 @@ fn op_dom_inner(shared: SharedState, cmd: String, arg1: String, arg2: String) ->
             });
             "null".to_string()
         }
+        "window_named_names" => {
+            let root = NodeId::new(arg1.parse().unwrap_or(u32::MAX));
+            let mut names = Vec::new();
+            let mut seen = HashSet::new();
+            for node in std::iter::once(root).chain(dom.descendants(root)) {
+                dom.with_node(node, |node| {
+                    for name in window_named_attributes(node).into_iter().flatten() {
+                        if seen.insert(name.to_string()) { names.push(name.to_string()); }
+                    }
+                });
+            }
+            serde_json::to_string(&names).unwrap_or_else(|_| "[]".into())
+        }
+        "window_named_candidates" => {
+            if arg1.is_empty() { return "[]".into(); }
+            let mut matches = Vec::new();
+            for node_id in dom.descendants(dom.document()) {
+                dom.with_node(node_id, |node| {
+                    let names = window_named_attributes(node);
+                    if names.contains(&Some(arg1.as_str())) {
+                        let named_frame = names[1] == Some(arg1.as_str())
+                            && node.as_element().is_some_and(|tag| tag.local.as_ref() == "iframe");
+                        matches.push((node_id.index(), named_frame));
+                    }
+                });
+            }
+            serde_json::to_string(&matches).unwrap_or_else(|_| "[]".into())
+        }
         "document_node_id" => dom.document().index().to_string(),
         "document_compat_mode" => if dom.is_quirks() { "BackCompat" } else { "CSS1Compat" }.into(),
         "document_title" => {
@@ -2466,6 +2556,8 @@ fn op_dom_inner(shared: SharedState, cmd: String, arg1: String, arg2: String) ->
             serde_json::to_string(&title).unwrap_or("\"\"".into())
         }
         "document_url" => serde_json::to_string(&gs.url).unwrap_or("\"\"".into()),
+        "scripting_enabled" => gs.scripting_enabled.to_string(),
+        "sandbox_opaque_origin" => gs.sandbox_opaque_origin.to_string(),
         "document_origin" => serde_json::to_string(&gs.inherited_origin.clone().unwrap_or_else(|| {
             url::Url::parse(&gs.url).map(|url| url.origin().ascii_serialization())
                 .unwrap_or_else(|_| "null".to_string())
@@ -2484,6 +2576,9 @@ fn op_dom_inner(shared: SharedState, cmd: String, arg1: String, arg2: String) ->
         }
         "document_referrer" => serde_json::to_string(&gs.referrer).unwrap_or("\"\"".into()),
         "document_encoding" => serde_json::to_string(&gs.encoding).unwrap_or("\"UTF-8\"".into()),
+        "document_content_type" => {
+            serde_json::to_string(&gs.content_type).unwrap_or("\"text/html\"".into())
+        }
         "document_element" => {
             for cid in dom.children(dom.document()) {
                 if let Some(n) = dom.get_node(cid) {
@@ -2677,7 +2772,14 @@ fn op_dom_inner(shared: SharedState, cmd: String, arg1: String, arg2: String) ->
                 .with_node(NodeId::new(nid), |n| {
                     n.as_element().map(|name| {
                         if name.ns == html5ever::ns!(html) {
-                            name.local.as_ref().to_ascii_uppercase()
+                            match &name.prefix {
+                                Some(prefix) => {
+                                    let mut qualified = format!("{}:{}", prefix, name.local);
+                                    qualified.make_ascii_uppercase();
+                                    qualified
+                                }
+                                None => name.local.as_ref().to_ascii_uppercase(),
+                            }
                         } else {
                             match &name.prefix {
                                 Some(prefix) => format!("{}:{}", prefix, name.local),
@@ -2689,6 +2791,13 @@ fn op_dom_inner(shared: SharedState, cmd: String, arg1: String, arg2: String) ->
                 .flatten()
                 .unwrap_or_default();
             serde_json::to_string(&name).unwrap_or("\"\"".into())
+        }
+        "prefix" => {
+            let nid = arg1.parse::<u32>().unwrap_or(0);
+            let prefix = dom.with_node(NodeId::new(nid), |n| {
+                n.as_element().and_then(|name| name.prefix.as_ref().map(|prefix| prefix.to_string()))
+            }).flatten();
+            serde_json::to_string(&prefix).unwrap_or("null".into())
         }
         "local_name" => {
             let nid = arg1.parse::<u32>().unwrap_or(0);
@@ -2721,6 +2830,33 @@ fn op_dom_inner(shared: SharedState, cmd: String, arg1: String, arg2: String) ->
                 })
                 .flatten();
             serde_json::to_string(&val).unwrap_or("null".into())
+        }
+        "parse_html_document" => {
+            let root = NodeId::new(arg1.parse::<u32>().unwrap_or(0));
+            if root == dom.document() || !dom.with_node(root, |node| matches!(node.data, NodeData::Document)).unwrap_or(false)
+                || !dom.children(root).is_empty()
+            {
+                return "null".into();
+            }
+            use html5ever::tendril::TendrilSink;
+            let mut options = html5ever::ParseOpts::default();
+            options.tree_builder.scripting_enabled = false;
+            let parsed = html5ever::parse_document(DomTree::new(), options).from_utf8().one(arg2.as_bytes());
+            dom.import_children_from(root, &parsed, parsed.document());
+            mark_script_subtree_started(&gs, root);
+            if parsed.is_quirks() { "BackCompat" } else { "CSS1Compat" }.into()
+        }
+        "attribute_metadata" => {
+            let nid = arg1.parse::<u32>().unwrap_or(0);
+            let info = dom.with_node(NodeId::new(nid), |node| {
+                let attr = node.attrs()?.iter().find(|attr| attr.qualified_name_eq(&arg2))?;
+                Some(serde_json::json!({
+                    "name": attr.qualified_name(), "value": attr.value,
+                    "namespaceURI": if attr.name.ns.is_empty() { None } else { Some(attr.name.ns.as_ref()) },
+                    "prefix": attr.name.prefix.as_ref().map(|prefix| prefix.as_ref()),
+                }))
+            }).flatten();
+            serde_json::to_string(&info).unwrap_or("null".into())
         }
         "attribute_names" => {
             let nid = arg1.parse::<u32>().unwrap_or(0);
@@ -3167,6 +3303,35 @@ fn op_dom_inner(shared: SharedState, cmd: String, arg1: String, arg2: String) ->
             let other = arg2.parse::<u32>().unwrap_or(0);
             dom.descendants(NodeId::new(nid))
                 .contains(&NodeId::new(other))
+                .to_string()
+        }
+        // arg1 is an inclusive ancestor of arg2 through ordinary parents.
+        "is_inclusive_ancestor" => {
+            let (Ok(ancestor), Ok(node)) = (arg1.parse::<u32>(), arg2.parse::<u32>()) else {
+                return "false".into();
+            };
+            dom.is_inclusive_ancestor(NodeId::new(ancestor), NodeId::new(node))
+                .to_string()
+        }
+        // "previous,next" sibling ids of arg1, -1 for none: one crossing for
+        // the pair a mutation record captures.
+        "sibling_nids" => {
+            let Ok(nid) = arg1.parse::<u32>() else {
+                return "-1,-1".into();
+            };
+            let (prev, next) = dom
+                .with_node(NodeId::new(nid), |node| (node.prev_sibling, node.next_sibling))
+                .unwrap_or((None, None));
+            let id = |value: Option<NodeId>| value.map_or(-1, |id| id.index() as i64);
+            format!("{},{}", id(prev), id(next))
+        }
+        // arg1 is a host-including inclusive ancestor of arg2. Walks up from
+        // arg2 instead of enumerating arg1's descendants.
+        "is_host_including_inclusive_ancestor" => {
+            let (Ok(ancestor), Ok(node)) = (arg1.parse::<u32>(), arg2.parse::<u32>()) else {
+                return "false".into();
+            };
+            dom.is_host_including_inclusive_ancestor(NodeId::new(ancestor), NodeId::new(node))
                 .to_string()
         }
         // Connectivity is maintained incrementally by DomTree. Exposing the
@@ -3841,6 +4006,55 @@ fn visible_response_headers(
         .collect()
 }
 
+/// Match a CDP `Fetch.enable` / `Network.setBlockedURLs` URL pattern, where
+/// `*` matches any run, `?` matches one character, and backslash escapes.
+/// Shared with the CDP layer so reported pauses match live interception.
+pub fn url_matches_cdp_pattern(pattern: &str, url: &str) -> bool {
+    if pattern == "*" {
+        return true;
+    }
+    let mut pattern = pattern.chars();
+    let mut url = url.chars();
+    let mut star = None;
+    loop {
+        let mut next_pattern = pattern.clone();
+        match next_pattern.next() {
+            Some('*') => {
+                pattern = next_pattern;
+                star = Some((pattern.clone(), url.clone()));
+                continue;
+            }
+            None if url.as_str().is_empty() => return true,
+            Some(token) => {
+                let literal = if token == '\\' { next_pattern.next() } else { Some(token) };
+                let mut next_url = url.clone();
+                if let Some(character) = next_url.next() {
+                    if token == '?' || literal == Some(character) {
+                        pattern = next_pattern;
+                        url = next_url;
+                        continue;
+                    }
+                }
+            }
+            _ => {}
+        }
+        let Some((saved_pattern, saved_url)) = &mut star else {
+            return false;
+        };
+        if saved_url.next().is_none() {
+            return false;
+        }
+        pattern = saved_pattern.clone();
+        url = saved_url.clone();
+    }
+}
+
+/// Whether a scripted request is paused for the interception consumer. Like
+/// Chrome, only requests matching a `Fetch.enable` URL pattern pause.
+pub(crate) fn should_intercept_url(enabled: bool, patterns: &[String], url: &str) -> bool {
+    enabled && (patterns.is_empty() || patterns.iter().any(|pattern| url_matches_cdp_pattern(pattern, url)))
+}
+
 /// Build the JS-facing result for an intercepted request a CDP client chose to
 /// fulfill (`Fetch.fulfillRequest`). Mirrors the normal fetch result contract:
 /// `body` is a lossy text view and `bodyBase64` carries the exact bytes, which
@@ -3973,7 +4187,7 @@ async fn fetch_url_inner(
         // The CDP resolver map spans pages and navigations on a connection.
         static NEXT_REQUEST_ID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
         let request_id = format!("fetch-{}", NEXT_REQUEST_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed));
-        let itx = if gs.intercept_enabled {
+        let itx = if should_intercept_url(gs.intercept_enabled, &gs.intercept_url_patterns, &url) {
             gs.intercept_tx.clone()
         } else {
             None
@@ -4131,7 +4345,7 @@ async fn fetch_url_inner(
                     override_url = url;
                     override_method = method;
                     override_headers = headers;
-                    override_body = body.map(String::into_bytes);
+                    override_body = body;
                     tracing::debug!(
                         "Interception: continue (overrides url={} method={} headers={} body={})",
                         override_url.is_some(),
@@ -5204,6 +5418,51 @@ mod tests {
         );
     }
 
+    #[test]
+    fn scripted_requests_pause_only_for_matching_fetch_patterns() {
+        let url = "https://example.test/value/1";
+        assert!(!super::should_intercept_url(false, &[], url));
+        assert!(super::should_intercept_url(true, &[], url));
+        assert!(super::should_intercept_url(true, &["*".to_string()], url));
+        assert!(super::should_intercept_url(true, &["*/value/*".to_string()], url));
+        assert!(!super::should_intercept_url(true, &["*never-matches*".to_string()], url));
+        assert!(super::should_intercept_url(
+            true,
+            &["*never-matches*".to_string(), "https://example.test/*".to_string()],
+            url
+        ));
+    }
+
+    #[test]
+    fn interception_patterns_match_repeated_suffixes_and_escaped_wildcards() {
+        for (pattern, url, expected) in [
+            ("/a*abc", "/aabcabc", true),
+            ("*abc", "abcabc", true),
+            ("/a?c", "/abc", true),
+            ("/a?c", "/ac", false),
+            ("/a?c", "/abbc", false),
+            (r"/a\?c", "/a?c", true),
+            (r"/a\?c", "/abc", false),
+            (r"/a\*c", "/a*c", true),
+            (r"/a\*c", "/abc", false),
+            (r"/a\\c", r"/a\c", true),
+            ("/a?c", "/aéc", true),
+            ("", "", true),
+            ("", "/", false),
+            ("**", "", true),
+            ("/a*c", "/ab", false),
+            ("*ab*bc", "ababbbc", true),
+            ("*ab*bc", "abbcd", false),
+            ("*?*", "", false),
+            ("*?*", "abc", true),
+            ("ab*cd*ef", "abxxcdyyef", true),
+            ("ab*cd*ef", "abxxcdyyefzz", false),
+        ] {
+            assert_eq!(super::url_matches_cdp_pattern(pattern, url), expected,
+                "pattern {pattern:?}, URL {url:?}");
+        }
+    }
+
     // #967 — a redirect must not forward the caller's credentials to a
     // different origin, and a 301/302/303 GET downgrade drops the body headers.
     #[test]
@@ -5559,7 +5818,7 @@ mod tests {
     // buffer straight from an untrusted u32 length. Each must reject a length
     // above its fixed maximum before allocating, and still work for ordinary
     // inputs. See #910.
-    use super::{HKDF_MAX_OUTPUT_BYTES, RANDOM_BYTES_MAX, hkdf_derive, random_bytes};
+    use super::{HKDF_MAX_OUTPUT_BYTES, RANDOM_BYTES_MAX, aes_kw, hkdf_derive, oct_jwk_json, parse_jwk, random_bytes};
 
     #[test]
     fn hkdf_rejects_excessive_output_length() {
@@ -5582,6 +5841,57 @@ mod tests {
         let okm = hkdf_derive("SHA-256", b"ikm", b"salt", b"info", 32)
             .expect("ordinary parameters must derive successfully");
         assert_eq!(okm.len(), 32, "derived key must have the requested length");
+    }
+
+    // RFC 3394, section 4.1: 128 bits of key data with a 128-bit KEK.
+    #[test]
+    fn aes_kw_matches_rfc_3394() {
+        let kek: Vec<u8> = (0u8..16).collect();
+        let data: Vec<u8> = (0u8..16).map(|i| i * 0x11).collect();
+        let wrapped = aes_kw(true, &kek, &data).expect("a 128-bit key wraps");
+        assert_eq!(
+            wrapped,
+            [
+                0x1f, 0xa6, 0x8b, 0x0a, 0x81, 0x12, 0xb4, 0x47, 0xae, 0xf3, 0x4b, 0xd8, 0xfb, 0x5a,
+                0x7b, 0x82, 0x9d, 0x3e, 0x86, 0x23, 0x71, 0xd2, 0xcf, 0xe5
+            ]
+        );
+        assert_eq!(aes_kw(false, &kek, &wrapped).expect("the wrap unwraps"), data);
+    }
+
+    #[test]
+    fn aes_kw_rejects_tampering_and_bad_sizes() {
+        let kek = [7u8; 32];
+        let mut wrapped = aes_kw(true, &kek, &[1u8; 24]).expect("a 192-bit key wraps");
+        wrapped[3] ^= 1;
+        assert!(aes_kw(false, &kek, &wrapped).is_err(), "a tampered wrap must not unwrap");
+        assert!(aes_kw(false, &[8u8; 32], &aes_kw(true, &kek, &[1u8; 16]).unwrap()).is_err(), "another key must not unwrap");
+        assert!(aes_kw(true, &kek, &[1u8; 20]).is_err(), "data not a multiple of 8 bytes must not wrap");
+        assert!(aes_kw(true, &kek, &[1u8; 8]).is_err(), "a single block must not wrap");
+        assert!(aes_kw(false, &kek, &[1u8; 16]).is_err(), "a single wrapped block must not unwrap");
+        assert!(aes_kw(false, &kek, &[]).is_err(), "nothing must not unwrap");
+        assert!(aes_kw(true, &[7u8; 20], &[1u8; 16]).is_err(), "a 160-bit KEK is not an AES key");
+    }
+
+    #[test]
+    fn oct_jwk_json_is_in_lexicographic_order() {
+        let ops = vec!["sign".to_string(), "verify".to_string()];
+        assert_eq!(
+            String::from_utf8(oct_jwk_json("HS256", true, "AQID", &ops)).unwrap(),
+            r#"{"alg":"HS256","ext":true,"k":"AQID","key_ops":["sign","verify"],"kty":"oct"}"#
+        );
+        assert_eq!(
+            String::from_utf8(oct_jwk_json("", false, "AQID", &[])).unwrap(),
+            r#"{"ext":false,"k":"AQID","key_ops":[],"kty":"oct"}"#
+        );
+    }
+
+    #[test]
+    fn parse_jwk_wants_a_json_object() {
+        assert!(parse_jwk(br#"{"kty":"oct","k":"AQID"}"#).unwrap().is_object());
+        assert!(parse_jwk(b"not json").is_err());
+        assert!(parse_jwk(b"[1, 2]").is_err());
+        assert!(parse_jwk(b"\"oct\"").is_err());
     }
 
     #[test]
@@ -6504,12 +6814,17 @@ pub struct SessionHistory {
     pub current: usize,
 }
 
+fn navigation_state(state: &OpState, frame_id: u32) -> Option<SharedState> {
+    if frame_id == 0 { return Some(state.borrow::<SharedState>().clone()); }
+    state.try_borrow::<Rc<RefCell<RealmStates>>>()?.borrow().by_frame_id(frame_id)
+}
+
 /// `"documentStart,current,length"` of the session history; length is 0 when
 /// this realm has none.
 #[op2]
 #[string]
-fn op_session_history(scope: &mut v8::PinScope, state: &OpState) -> String {
-    let gs = realm_state(scope, state);
+fn op_session_history(state: &OpState, frame_id: u32) -> String {
+    let Some(gs) = navigation_state(state, frame_id) else { return "0,0,0".into(); };
     let gs = gs.borrow();
     let history = &gs.session_history;
     format!("{},{},{}", history.document_start, history.current, history.urls.len())
@@ -6518,8 +6833,8 @@ fn op_session_history(scope: &mut v8::PinScope, state: &OpState) -> String {
 /// Queue a traversal to another document's session history entry. Returns
 /// false when the index is out of range.
 #[op2(fast)]
-fn op_history_traverse(scope: &mut v8::PinScope, state: &OpState, index: u32) -> bool {
-    let gs = realm_state(scope, state);
+fn op_history_traverse(state: &OpState, index: u32, frame_id: u32) -> bool {
+    let Some(gs) = navigation_state(state, frame_id) else { return false; };
     let mut gs = gs.borrow_mut();
     let index = index as usize;
     let Some(url) = gs.session_history.urls.get(index).cloned() else {
@@ -6531,16 +6846,19 @@ fn op_history_traverse(scope: &mut v8::PinScope, state: &OpState, index: u32) ->
 }
 
 // A frame that navigates itself must not move the top document. Recording the
-// navigation against the calling realm keeps it inside that frame.
+// navigation against the realm that owns the Location object keeps it inside
+// that frame, also when another realm calls it: the page can run
+// `iframe.contentWindow.location.replace(url)`, and the running context is
+// then the page's, not the frame's (see `frame_state`).
 #[op2(fast)]
 fn op_navigate(
-    scope: &mut v8::PinScope,
     state: &OpState,
     #[string] url: &str,
     #[string] method: &str,
     #[string] body: &str,
+    frame_id: u32,
 ) {
-    let gs = realm_state(scope, state);
+    let Some(gs) = navigation_state(state, frame_id) else { return; };
     let mut gs = gs.borrow_mut();
     // Only queue the navigation — do NOT change the realm URL here. The URL is
     // updated on commit via `set_url` once the navigation is actually performed.
@@ -6752,22 +7070,28 @@ pub fn max_live_frames() -> usize {
         .and_then(|value| value.parse().ok()).unwrap_or(64)
 }
 
-/// An initial about:blank needs its own realm before the next JS statement.
-#[op2(nofast)]
+/// Initial blank and srcdoc documents share their creator's realm setup.
+/// reentrant: the initialize callback synchronously bootstraps the child
+/// frame and invokes other ops (e.g. op_dom); without this flag deno_core's
+/// re-entrancy check aborts the whole process.
+#[op2(reentrant)]
 fn op_initial_frame(
     scope: &mut v8::PinScope,
     state: &OpState,
     parent_frame_id: u32,
     initialize: v8::Local<v8::Function>,
     owner_node: u32,
+    #[string] srcdoc: Option<String>,
 ) -> u32 {
     std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         let registry = state.borrow::<Rc<RefCell<RealmStates>>>().clone();
         let page = state.borrow::<SharedState>().clone();
         let parent_state = frame_state(state, parent_frame_id);
+        let frame_url = if srcdoc.is_some() { "about:srcdoc" } else { "about:blank" };
+        let bytes = frame_url.len().saturating_add(srcdoc.as_ref().map_or(0, String::len));
         if registry.borrow().live_count() >= max_live_frames()
             || page.borrow().pending_frames.len() >= MAX_PENDING_FRAME_DOCUMENTS
-            || page.borrow().pending_frame_bytes.saturating_add("about:blank".len()) > MAX_PENDING_FRAME_BYTES
+            || page.borrow().pending_frame_bytes.saturating_add(bytes) > MAX_PENDING_FRAME_BYTES
         {
             return 0;
         }
@@ -6791,16 +7115,31 @@ fn op_initial_frame(
         let mut child = ObscuraState::new();
         #[cfg(feature = "render")]
         child.set_viewport(300.0, 150.0);
+        let opaque;
         {
             let parent = parent_state.borrow();
-            child.dom = Some(obscura_dom::parse_html(
-                "<html><head></head><body></body></html>"));
+            let sandbox = srcdoc.as_ref().and_then(|_| parent.dom.as_ref())
+                .and_then(|dom| dom.with_node(NodeId::new(owner_node), |node|
+                    node.get_attribute("sandbox").map(str::to_owned)).flatten());
+            opaque = parent.sandbox_opaque_origin || sandbox.as_deref().is_some_and(|value|
+                !value.split_ascii_whitespace().any(|token| token.eq_ignore_ascii_case("allow-same-origin")));
+            child.sandbox_opaque_origin = opaque;
+            child.url = frame_url.to_string();
             child.frame_id = frame_id;
             child.about_base_url = document_base_url(&parent);
-            child.inherited_origin = Some(parent.inherited_origin.clone().unwrap_or_else(|| {
+            child.scripting_enabled = parent.scripting_enabled && sandbox.as_deref().is_none_or(|value|
+                value.split_ascii_whitespace().any(|token| token.eq_ignore_ascii_case("allow-scripts")));
+            child.dom = Some(if let Some(html) = srcdoc.as_deref() {
+                obscura_dom::parse_srcdoc(html, child.scripting_enabled)
+            } else {
+                obscura_dom::parse_html("<html><head></head><body></body></html>")
+            });
+            child.inherited_origin = Some(if opaque { "null".to_string() } else {
+                parent.inherited_origin.clone().unwrap_or_else(|| {
                 url::Url::parse(&parent.url).map(|url| url.origin().ascii_serialization())
                     .unwrap_or_else(|_| "null".to_string())
-            }));
+                })
+            });
             child.inherit_resources(&parent);
         }
         let handle = v8::Global::new(scope, context);
@@ -6809,16 +7148,20 @@ fn op_initial_frame(
         let window = context.global(scope);
         let id = v8::Integer::new_from_unsigned(scope, frame_id);
         let receiver = v8::undefined(scope);
-        if initialize.call(scope, receiver.into(), &[window.into(), id.into()]).is_none() {
+        let opaque_value = v8::Boolean::new(scope, opaque);
+        if initialize.call(scope, receiver.into(), &[window.into(), id.into(), opaque_value.into()]).is_none() {
             registry.borrow_mut().forget(&handle);
             return 0;
         }
+        // Initialization needs the creator's token; author code must never
+        // retain it when the sandbox requires an opaque origin.
+        if opaque { context.use_default_security_token(); }
         let mut page = page.borrow_mut();
-        page.pending_frame_bytes = page.pending_frame_bytes.saturating_add("about:blank".len());
+        page.pending_frame_bytes = page.pending_frame_bytes.saturating_add(bytes);
         page.pending_frames.push(PendingFrame {
             frame_id,
             parent_frame_id,
-            url: "about:blank".to_string(),
+            url: frame_url.to_string(),
             html: String::new(),
             viewport_width: 300,
             viewport_height: 150,
@@ -7130,6 +7473,97 @@ fn op_subtle_aes_ctr(
         }
     }
     Ok(buf)
+}
+
+/// AES-KW (RFC 3394) key wrap and unwrap, for `wrapKey` / `unwrapKey`. RFC 3394
+/// wraps at least two 64-bit blocks, so the data to wrap must be a multiple of
+/// 8 bytes and at least 16 (a wrap, at least 24); unwrapping checks the
+/// integrity value, so a wrong key or a tampered wrap is an error too (the
+/// shim's OperationError). Split out from the op so it is unit-testable.
+fn aes_kw(wrap: bool, key: &[u8], data: &[u8]) -> Result<Vec<u8>, deno_error::JsErrorBox> {
+    use aes_kw::{KekAes128, KekAes192, KekAes256};
+    // aes-kw itself accepts a single block.
+    if data.len() < if wrap { 16 } else { 24 } {
+        return Err(crypto_err("AES-KW wraps at least two 64-bit blocks"));
+    }
+    macro_rules! run {
+        ($kek:ty) => {{
+            let kek = <$kek>::try_from(key).map_err(crypto_err)?;
+            if wrap { kek.wrap_vec(data) } else { kek.unwrap_vec(data) }.map_err(crypto_err)?
+        }};
+    }
+    Ok(match key.len() {
+        16 => run!(KekAes128),
+        24 => run!(KekAes192),
+        32 => run!(KekAes256),
+        _ => return Err(crypto_err("AES-KW keys are 128, 192 or 256 bits")),
+    })
+}
+
+#[op2]
+#[buffer]
+fn op_subtle_aes_kw(
+    wrap: bool,
+    #[buffer] key: &[u8],
+    #[buffer] data: &[u8],
+) -> Result<Vec<u8>, deno_error::JsErrorBox> {
+    aes_kw(wrap, key, data)
+}
+
+/// A symmetric ("oct") JWK as `wrapKey` serializes it. Members are declared in
+/// lexicographic order, the order `JSON.stringify` gives a JsonWebKey
+/// dictionary.
+#[derive(serde::Serialize)]
+struct OctJwk<'a> {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    alg: Option<&'a str>,
+    ext: bool,
+    k: &'a str,
+    key_ops: &'a [String],
+    kty: &'static str,
+}
+
+/// The UTF-8 JSON text of an "oct" JWK, for `wrapKey`. Built here rather than
+/// with the page's `JSON.stringify`, so a `toJSON` or another override on the
+/// page's prototypes can't change the wrapped bytes: the spec serializes it in
+/// the context of a new global object. An empty `alg` is left out.
+fn oct_jwk_json(alg: &str, ext: bool, k: &str, key_ops: &[String]) -> Vec<u8> {
+    let jwk = OctJwk {
+        alg: (!alg.is_empty()).then_some(alg),
+        ext,
+        k,
+        key_ops,
+        kty: "oct",
+    };
+    serde_json::to_vec(&jwk).unwrap_or_default()
+}
+
+#[op2]
+#[buffer]
+fn op_subtle_jwk_json(
+    #[string] alg: &str,
+    ext: bool,
+    #[string] k: &str,
+    #[serde] key_ops: Vec<String>,
+) -> Vec<u8> {
+    oct_jwk_json(alg, ext, k, &key_ops)
+}
+
+/// Parses the JSON text `unwrapKey` decrypted for a "jwk" import, for the same
+/// reason as `oct_jwk_json`: not with the page's `JSON.parse`. Text that isn't
+/// JSON, or isn't an object, is an error (the shim's DataError).
+fn parse_jwk(bytes: &[u8]) -> Result<serde_json::Value, deno_error::JsErrorBox> {
+    let value: serde_json::Value = serde_json::from_slice(bytes).map_err(crypto_err)?;
+    if !value.is_object() {
+        return Err(crypto_err("the unwrapped key is not a JSON object"));
+    }
+    Ok(value)
+}
+
+#[op2]
+#[serde]
+fn op_subtle_jwk_parse(#[buffer] bytes: &[u8]) -> Result<serde_json::Value, deno_error::JsErrorBox> {
+    parse_jwk(bytes)
 }
 
 /// Generous upper bounds on PBKDF2 parameters. WebCrypto imposes no limit, but
@@ -7703,6 +8137,18 @@ fn op_canvas_paint_damage(state: &OpState, nid: u32) -> bool {
     connected
 }
 
+#[op2]
+#[string]
+fn op_frame_preload_scripts(state: &OpState) -> String {
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let registry = state.borrow::<Rc<RefCell<RealmStates>>>();
+        serde_json::to_string(&registry.borrow().frame_preload_scripts).unwrap_or("[]".into())
+    })).unwrap_or_else(|_| {
+        tracing::error!("op_frame_preload_scripts panicked; returning no scripts");
+        "[]".into()
+    })
+}
+
 pub fn build_extension() -> Extension {
     let mut ops = vec![
         op_dom(),
@@ -7750,6 +8196,9 @@ pub fn build_extension() -> Extension {
         op_subtle_aes_gcm(),
         op_subtle_aes_cbc(),
         op_subtle_aes_ctr(),
+        op_subtle_aes_kw(),
+        op_subtle_jwk_json(),
+        op_subtle_jwk_parse(),
         op_subtle_pbkdf2(),
         op_subtle_hkdf(),
         op_random_bytes(),
@@ -7781,6 +8230,7 @@ pub fn build_extension() -> Extension {
         ops.push(op_resize_observer_measurements());
         ops.push(op_intersection_observer_measurements());
         ops.push(op_computed_style());
+        ops.push(op_check_visibility());
         ops.push(op_set_hovered());
         ops.push(op_css_supports());
         ops.push(op_layout_metrics());
@@ -7791,6 +8241,7 @@ pub fn build_extension() -> Extension {
         ops.push(op_waapi_create());
         ops.push(op_waapi_control());
     }
+    ops.push(op_frame_preload_scripts());
     Extension {
         name: "obscura_dom",
         ops: std::borrow::Cow::Owned(ops),
@@ -8258,6 +8709,8 @@ pub(crate) fn sample_live_document_animations(state: &mut ObscuraState) {
 
 pub(crate) fn begin_animation_task(state: &mut ObscuraState) {
     state.animation_task_generation = state.animation_task_generation.wrapping_add(1);
+    #[cfg(feature = "render")]
+    { state.style_query_cache = None; }
 }
 
 #[op2(fast)]
@@ -8568,16 +9021,17 @@ async fn op_load_image_metadata(state: Rc<RefCell<OpState>>, nid: u32) -> String
 
     // Different CORS/credential profiles do not share an in-flight response.
     let request_key = (document_generation, selected_url.clone(), request_profile);
-    let follower = {
+    let (follower, cancel_rx) = {
         let mut gs = shared.borrow_mut();
-        if let Some(waiters) = gs.render_image_in_flight.get_mut(&request_key) {
+        if let Some((_, waiters)) = gs.render_image_in_flight.get_mut(&request_key) {
             let (sender, receiver) = tokio::sync::oneshot::channel();
             waiters.push(sender);
-            Some(receiver)
+            (Some(receiver), None)
         } else {
+            let (cancel_tx, cancel_rx) = tokio::sync::oneshot::channel();
             gs.render_image_in_flight
-                .insert(request_key.clone(), Vec::new());
-            None
+                .insert(request_key.clone(), (cancel_tx, Vec::new()));
+            (None, Some(cancel_rx))
         }
     };
     if let Some(receiver) = follower {
@@ -8590,6 +9044,7 @@ async fn op_load_image_metadata(state: Rc<RefCell<OpState>>, nid: u32) -> String
             request_profile,
         );
     }
+    let cancel_rx = cancel_rx.expect("image request leader owns cancellation");
 
     struct PageImageInFlightGuard(Arc<std::sync::atomic::AtomicU32>);
     impl Drop for PageImageInFlightGuard {
@@ -8601,7 +9056,7 @@ async fn op_load_image_metadata(state: Rc<RefCell<OpState>>, nid: u32) -> String
     let _page_in_flight = PageImageInFlightGuard(page_in_flight);
 
     let parsed_url = url::Url::parse(&selected_url).ok();
-    let response = if blocked || parsed_url.is_none() {
+    let fetch = async { if blocked || parsed_url.is_none() {
         None
     } else {
         let parsed_url = parsed_url.as_ref().unwrap();
@@ -8638,6 +9093,10 @@ async fn op_load_image_metadata(state: Rc<RefCell<OpState>>, nid: u32) -> String
                 .await
                 .ok()
         }
+    } };
+    let response = tokio::select! {
+        response = fetch => response,
+        _ = cancel_rx => None,
     };
     let bytes = response.and_then(|response| {
         (200..300)
@@ -8646,7 +9105,7 @@ async fn op_load_image_metadata(state: Rc<RefCell<OpState>>, nid: u32) -> String
     });
     let waiters = {
         let mut gs = shared.borrow_mut();
-        if gs.document_generation == document_generation {
+        if gs.document_generation == document_generation && gs.render_image_in_flight.contains_key(&request_key) {
             match bytes {
                 Some(bytes) => {
                     if obscura_render::image_intrinsic_dimensions(&bytes).is_some() {
@@ -8672,6 +9131,7 @@ async fn op_load_image_metadata(state: Rc<RefCell<OpState>>, nid: u32) -> String
         }
         gs.render_image_in_flight
             .remove(&request_key)
+            .map(|(_, waiters)| waiters)
             .unwrap_or_default()
     };
     for waiter in waiters {
@@ -9024,6 +9484,16 @@ fn op_intersection_observer_measurements(state: &OpState, #[string] nids_json: S
 /// CSSOM snapshot and completeness flag. Non-geometric reads can resolve only
 /// the ancestor cascade while leaving layout damage pending for geometry/paint.
 #[cfg(feature = "render")]
+pub(crate) struct StyleQueryCache {
+    task_generation: u64,
+    activity_generation: u64,
+    stylesheet_generation: u64,
+    viewport: (f32, f32),
+    media: obscura_render::CssMediaType,
+    cascade: obscura_render::dom::NonGeometricStyleCache,
+}
+
+#[cfg(feature = "render")]
 #[op2]
 #[string]
 fn op_computed_style(
@@ -9039,19 +9509,41 @@ fn op_computed_style(
     let mut gs = shared.borrow_mut();
     sample_live_document_animations(&mut gs);
     let base_url = document_base_url_for_javascript_task(&gs);
-    let needs_layout = gs.prepared_render.as_ref().is_none_or(|prepared| {
+    let needs_style_resolution = gs.prepared_render.as_ref().is_none_or(|prepared| {
         prepared.viewport() != gs.viewport || prepared.base_url() != base_url.as_deref()
-            || prepared.animation_sample() != gs.animation_sample
     }) || !gs.pending_style_mutations.is_empty();
-    if pseudo.is_empty() && needs_layout && gs.animation_timeline.waapi_nodes().is_empty() {
-        if let Some(snapshot) = gs.dom.as_ref().and_then(|dom| {
-            obscura_render::dom::computed_style_without_layout(
-                dom, nid, gs.viewport, gs.render_media, &gs.stylesheet_cache, &property,
-            )
+    // An animation-only time change can resample the existing frame without
+    // duplicating its style graph in the ancestor-cascade cache.
+    if pseudo.is_empty() && needs_style_resolution && gs.animation_timeline.waapi_nodes().is_empty()
+        && obscura_render::dom::NonGeometricStyleCache::supports(&property)
+    {
+        let mut cached = gs.style_query_cache.take();
+        let stylesheet_generation = gs.dom.as_ref().map_or(0, |dom| dom.external_stylesheet_generation());
+        if !cached.as_ref().is_some_and(|cache| {
+            cache.task_generation == gs.animation_task_generation
+                && cache.activity_generation == gs.activity_generation
+                && cache.stylesheet_generation == stylesheet_generation
+                && cache.viewport == gs.viewport && cache.media == gs.render_media
         }) {
+            cached = gs.dom.as_ref().and_then(|dom| {
+                obscura_render::dom::NonGeometricStyleCache::new(
+                    dom, gs.viewport, gs.render_media, &gs.stylesheet_cache,
+                )
+            }).map(|cascade| StyleQueryCache {
+                task_generation: gs.animation_task_generation,
+                activity_generation: gs.activity_generation,
+                stylesheet_generation, viewport: gs.viewport, media: gs.render_media, cascade,
+            });
+        }
+        let snapshot = cached.as_mut().and_then(|cache| {
+            cache.cascade.resolve(gs.dom.as_ref()?, nid, &property)
+        });
+        gs.style_query_cache = cached;
+        if let Some(snapshot) = snapshot {
             return serde_json::json!([false, snapshot]).to_string();
         }
     }
+    gs.style_query_cache = None;
     let Some(prepared) = ensure_prepared_render_with_base_url(&mut gs, base_url) else {
         return String::new();
     };
@@ -9066,6 +9558,11 @@ fn op_computed_style(
             |value| serde_json::to_string(value).unwrap_or_else(|_| "none".to_string()),
         );
         return serde_json::json!([true, { "content": content, "display": display }]).to_string();
+    }
+    if pseudo.is_empty() && obscura_render::dom::NonGeometricStyleCache::supports(&property) {
+        if let Some(snapshot) = prepared.computed_non_geometric_style(nid) {
+            return serde_json::json!([false, snapshot]).to_string();
+        }
     }
     let Some(snapshot) = prepared.computed_style(nid) else {
         return String::new();
@@ -9095,6 +9592,35 @@ fn op_set_hovered(state: &OpState, nid: u32, frame_id: u32) {
         state.pending_style_mutations.clear();
         state.resolved_scroll = None;
     }
+}
+
+/// `Element.checkVisibility()` in one native call. Walking ancestors through
+/// `getComputedStyle()` cost a JS proxy per ancestor, and Playwright calls
+/// this before every action.
+#[cfg(feature = "render")]
+#[op2(fast)]
+fn op_check_visibility(
+    state: &OpState,
+    nid: u32,
+    check_opacity: bool,
+    check_visibility_css: bool,
+    frame_id: u32,
+) -> bool {
+    let shared = frame_state(state, frame_id);
+    let mut gs = shared.borrow_mut();
+    sample_live_document_animations(&mut gs);
+    if ensure_prepared_render(&mut gs).is_none() {
+        return false;
+    }
+    let (Some(prepared), Some(dom)) = (gs.prepared_render.as_ref(), gs.dom.as_ref()) else {
+        return false;
+    };
+    prepared.check_visibility(
+        dom,
+        obscura_dom::tree::NodeId::new(nid),
+        check_opacity,
+        check_visibility_css,
+    )
 }
 
 /// Use the renderer's declaration parser as the single feature-query source

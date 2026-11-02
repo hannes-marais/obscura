@@ -3,6 +3,7 @@ use std::pin::Pin;
 use std::rc::{Rc, Weak};
 use std::sync::Arc;
 
+
 use deno_core::error::ModuleLoaderError;
 use deno_core::ModuleLoadOptions;
 use deno_core::ModuleLoadReferrer;
@@ -15,7 +16,7 @@ use deno_core::ModuleSpecifier;
 use deno_error::JsErrorBox;
 
 use crate::import_map::ImportMap;
-use crate::ops::ObscuraState;
+use crate::ops::{ObscuraState, JsNetworkEvent, FetchNetworkGuard};
 
 /// Observable network activity for ES-module graphs.
 ///
@@ -61,26 +62,33 @@ struct ModuleTransferGuard {
     document_url: String,
     requested_url: String,
     finished: bool,
+    fallback: Option<FetchNetworkGuard>,
 }
 
 impl ModuleTransferGuard {
     fn finish(&mut self, response: Option<&obscura_net::Response>, error: Option<String>) {
         self.finished = true;
+        let mut recorded = false;
         if let (Some(state), Some(origin)) = (self.state.as_ref().and_then(Weak::upgrade), self.origin) {
             match state.try_borrow_mut() {
-                Ok(mut state) => crate::ops::record_module_completion(&mut state, &self.document_url,
+                Ok(mut state) => recorded = crate::ops::record_module_completion(&mut state, &self.document_url,
                     origin, self.started, &self.requested_url, response, error),
                 Err(error) => tracing::warn!(%error, "Cannot record module completion: page state is borrowed"),
             }
+        }
+        if recorded || response.is_some() {
+            if let Some(guard) = &mut self.fallback { guard.event = None; }
         }
     }
 }
 
 impl Drop for ModuleTransferGuard {
     fn drop(&mut self) {
-        if !self.finished { self.finish(None, Some("Module fetch cancelled".into())); }
+        if !self.finished { self.finish(None, Some("net::ERR_FAILED".into())); }
     }
 }
+
+
 
 impl Drop for ModuleLoadGuard {
     fn drop(&mut self) {
@@ -296,11 +304,23 @@ impl ModuleLoader for ObscuraModuleLoader {
                 Ok((client, stealth, callbacks, origin)) => {
                     let requested = ModuleSpecifier::parse(&url)
                         .map_err(|e| io_err(format!("Invalid module URL {}: {}", url, e)))?;
+                    static NEXT_MODULE_REQUEST_ID: std::sync::atomic::AtomicU64 =
+                        std::sync::atomic::AtomicU64::new(1);
+                    let network_guard = page_state.as_ref().map(|state| FetchNetworkGuard {
+                        state: state.clone(), cancel: None,
+                        event: Some(JsNetworkEvent {
+                            request_id: format!("module-failure-{}", NEXT_MODULE_REQUEST_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed)),
+                            intercepted: false, url: url.clone(), method: "GET".to_string(),
+                            resource_type: "Script".to_string(), status: 0,
+                            response_headers: Default::default(), body_size: 0,
+                            encoded_data_length: None, timestamp: 0.0, error_text: None,
+                        }),
+                    });
                     let request =
                         obscura_net::ResourceRequest::module_script(&document_url, &referrer);
                     let mut transfer = ModuleTransferGuard {
-                        state: page_state, origin, started: std::time::Instant::now(),
-                        document_url: document_url.to_string(), requested_url: url.clone(), finished: false,
+                        state: page_state.clone(), origin, started: std::time::Instant::now(),
+                        document_url: document_url.to_string(), requested_url: url.clone(), finished: false, fallback: network_guard,
                     };
                     #[cfg(feature = "stealth")]
                     let resp = match stealth {
@@ -333,9 +353,12 @@ impl ModuleLoader for ObscuraModuleLoader {
                             .await
                     };
                     let resp = match resp {
-                        Ok(response) => { transfer.finish(Some(&response), None); response }
+                        Ok(response) => {
+                            transfer.finish(Some(&response), None);
+                            response
+                        }
                         Err(error) => {
-                            transfer.finish(None, Some(error.to_string()));
+                            transfer.finish(None, Some("net::ERR_FAILED".into()));
                             return Err(io_err(format!("Failed to fetch module {}: {}", url, error)));
                         }
                     };

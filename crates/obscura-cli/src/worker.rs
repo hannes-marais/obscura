@@ -1,7 +1,7 @@
 
 use std::sync::Arc;
 
-use obscura_browser::{BrowserContext, Page};
+use obscura_browser::{BrowserContext, Page, WaitUntil};
 use serde::{Deserialize, Serialize};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 
@@ -9,7 +9,11 @@ use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 #[serde(tag = "cmd")]
 enum WorkerCommand {
     #[serde(rename = "navigate")]
-    Navigate { url: String },
+    Navigate {
+        url: String,
+        #[serde(default, rename = "waitUntil")]
+        wait_until: NavigationWaitUntil,
+    },
     #[serde(rename = "evaluate")]
     Evaluate { expression: String },
     #[serde(rename = "title")]
@@ -20,6 +24,31 @@ enum WorkerCommand {
     DumpText,
     #[serde(rename = "shutdown")]
     Shutdown,
+}
+
+/// Keep the wire protocol strict: WaitUntil::from_str falls back to Load.
+#[derive(Debug, Default, Deserialize)]
+enum NavigationWaitUntil {
+    #[default]
+    #[serde(rename = "load")]
+    Load,
+    #[serde(rename = "domcontentloaded")]
+    DomContentLoaded,
+    #[serde(rename = "networkidle0")]
+    NetworkIdle0,
+    #[serde(rename = "networkidle2")]
+    NetworkIdle2,
+}
+
+impl From<NavigationWaitUntil> for WaitUntil {
+    fn from(value: NavigationWaitUntil) -> Self {
+        match value {
+            NavigationWaitUntil::Load => Self::Load,
+            NavigationWaitUntil::DomContentLoaded => Self::DomContentLoaded,
+            NavigationWaitUntil::NetworkIdle0 => Self::NetworkIdle0,
+            NavigationWaitUntil::NetworkIdle2 => Self::NetworkIdle2,
+        }
+    }
 }
 
 #[derive(Debug, Serialize)]
@@ -57,7 +86,12 @@ async fn main() {
     let obey_robots = std::env::var("OBSCURA_OBEY_ROBOTS")
         .map(|v| matches!(v.trim(), "1" | "true" | "yes" | "on"))
         .unwrap_or(false);
-    let mut context = BrowserContext::with_options("worker".to_string(), proxy, stealth);
+    let user_agent = std::env::var("OBSCURA_USER_AGENT")
+        .ok()
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty());
+    let mut context =
+        BrowserContext::with_full_options("worker".to_string(), proxy, stealth, user_agent);
     context.obey_robots = obey_robots;
     let context = Arc::new(context);
     let mut page = Page::new("page-1".to_string(), context);
@@ -96,8 +130,8 @@ async fn main() {
         };
 
         let resp = match cmd {
-            WorkerCommand::Navigate { url } => {
-                match page.navigate(&url).await {
+            WorkerCommand::Navigate { url, wait_until } => {
+                match page.navigate_with_wait(&url, wait_until.into()).await {
                     Ok(()) => {
                         // Navigation clears the event list and records the main
                         // Document response before scripts and child frames.

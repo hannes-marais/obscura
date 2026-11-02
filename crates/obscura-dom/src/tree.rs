@@ -637,6 +637,11 @@ impl DomTree {
         self.inner.borrow().shadow_roots_by_host.get(&host).copied()
     }
 
+    /// Whether any native shadow roots exist, including detached roots.
+    pub fn has_shadow_roots(&self) -> bool {
+        !self.inner.borrow().shadow_roots.is_empty()
+    }
+
     pub fn shadow_root_info(&self, root: NodeId) -> Option<ShadowRoot> {
         self.inner.borrow().shadow_roots.get(&root).copied()
     }
@@ -754,6 +759,37 @@ impl DomTree {
             .and_then(|entry| entry.as_ref())
             .and_then(|entry| entry.parent)
             .or_else(|| inner.shadow_roots.get(&node).map(|root| root.host))
+    }
+
+    /// Whether `ancestor` is an inclusive ancestor of `node` through ordinary
+    /// parent links only (a shadow root ends the walk), as MutationObserver
+    /// subtree matching requires. Bounded like the other ancestor walks.
+    pub fn is_inclusive_ancestor(&self, ancestor: NodeId, node: NodeId) -> bool {
+        let inner = self.inner.borrow();
+        let mut current = Some(node);
+        for _ in 0..=inner.nodes.len() {
+            let Some(id) = current else { return false };
+            if id == ancestor {
+                return true;
+            }
+            current = inner
+                .nodes
+                .get(id.index())
+                .and_then(|entry| entry.as_ref())
+                .and_then(|entry| entry.parent);
+        }
+        false
+    }
+
+    /// Whether `ancestor` is a host-including inclusive ancestor of `node`, the
+    /// DOM pre-insertion check that stops a node from being inserted into its
+    /// own subtree. Uses the same bounded walk as the reparenting guards.
+    pub fn is_host_including_inclusive_ancestor(&self, ancestor: NodeId, node: NodeId) -> bool {
+        if ancestor == node {
+            return true;
+        }
+        let inner = self.inner.borrow();
+        Self::would_create_host_including_cycle(&inner, node, ancestor)
     }
 
     /// DOM insertion rejects a node when it is a host-including inclusive
@@ -2239,6 +2275,52 @@ mod tests {
         tree.insert_before(shadow_child, host);
         assert_eq!(tree.get_node(host).unwrap().parent, Some(document));
         assert_eq!(tree.children(root), vec![shadow_child]);
+    }
+
+    #[test]
+    fn host_including_ancestor_query_follows_parents_and_hosts() {
+        let tree = DomTree::new();
+        let document = tree.document();
+        let outer = element(&tree, "div");
+        let host = element(&tree, "x-card");
+        let leaf = element(&tree, "i");
+        tree.append_child(document, outer);
+        tree.append_child(outer, host);
+        let root = tree
+            .attach_shadow_root(host, ShadowRootMode::Open)
+            .unwrap();
+        let shadow_child = element(&tree, "span");
+        tree.append_child(root, shadow_child);
+
+        assert!(tree.is_host_including_inclusive_ancestor(shadow_child, shadow_child));
+        assert!(tree.is_host_including_inclusive_ancestor(outer, host));
+        assert!(tree.is_host_including_inclusive_ancestor(host, shadow_child));
+        assert!(tree.is_host_including_inclusive_ancestor(outer, shadow_child));
+        assert!(tree.is_host_including_inclusive_ancestor(document, shadow_child));
+        assert!(!tree.is_host_including_inclusive_ancestor(shadow_child, outer));
+        assert!(!tree.is_host_including_inclusive_ancestor(leaf, outer));
+        assert!(!tree.is_host_including_inclusive_ancestor(host, outer));
+    }
+
+    #[test]
+    fn inclusive_ancestor_query_stops_at_shadow_roots() {
+        let tree = DomTree::new();
+        let document = tree.document();
+        let outer = element(&tree, "div");
+        let host = element(&tree, "x-card");
+        tree.append_child(document, outer);
+        tree.append_child(outer, host);
+        let root = tree
+            .attach_shadow_root(host, ShadowRootMode::Open)
+            .unwrap();
+        let shadow_child = element(&tree, "span");
+        tree.append_child(root, shadow_child);
+
+        assert!(tree.is_inclusive_ancestor(outer, outer));
+        assert!(tree.is_inclusive_ancestor(document, host));
+        assert!(tree.is_inclusive_ancestor(root, shadow_child));
+        assert!(!tree.is_inclusive_ancestor(host, shadow_child));
+        assert!(!tree.is_inclusive_ancestor(host, outer));
     }
 
     #[test]

@@ -299,12 +299,18 @@ pub fn ua_style(tag: &str) -> LayoutStyle {
             style.border_spacing = Some((2.0, 2.0));
             style.border_collapse = Some(false);
         } else {
+            style.table_row_display = Some(match tag {
+                "thead" => crate::TableRowDisplay::Header,
+                "tfoot" => crate::TableRowDisplay::Footer,
+                _ => crate::TableRowDisplay::Group,
+            });
             style.width = crate::Dimension::Percent(1.0);
             // The row-group UA rule is the source of the effective default
             // middle alignment; rows and cells inherit it below.
             style.vertical_align = Some(crate::VerticalAlign::Middle);
         }
     } else if tag == "tr" {
+        style.table_row_display = Some(crate::TableRowDisplay::Row);
         style.internal_flex_container = true;
         // Rows fill the table width and can shrink below content min-content;
         // this is exactly why Wikipedia's own responsive CSS uses
@@ -866,6 +872,10 @@ fn apply_value(style: &mut LayoutStyle, name: &str, value: &str) {
                     | "table"
                     | "inline-table"
                     | "table-cell"
+                    | "table-row"
+                    | "table-row-group"
+                    | "table-header-group"
+                    | "table-footer-group"
                     | "-webkit-box"
                     | "-webkit-inline-box"
                     | "contents"
@@ -880,6 +890,7 @@ fn apply_value(style: &mut LayoutStyle, name: &str, value: &str) {
                 style.internal_flex_container = false;
                 style.is_table_box = false;
                 style.is_table_cell_box = false;
+                style.table_row_display = None;
                 style.is_inline_block = false;
                 style.flow_root = false;
                 style.display_contents = false;
@@ -922,6 +933,15 @@ fn apply_value(style: &mut LayoutStyle, name: &str, value: &str) {
                     style.is_inline_block = true;
                     style.flow_root = true;
                     style.is_table_box = true;
+                }
+                "table-row" | "table-row-group" | "table-header-group" | "table-footer-group" => {
+                    style.table_row_display = Some(match value.as_str() {
+                        "table-row" => crate::TableRowDisplay::Row,
+                        "table-header-group" => crate::TableRowDisplay::Header,
+                        "table-footer-group" => crate::TableRowDisplay::Footer,
+                        _ => crate::TableRowDisplay::Group,
+                    });
+                    style.display = crate::Display::Block;
                 }
                 "table-cell" => {
                     // A table cell establishes an internal flow container. A
@@ -1265,6 +1285,7 @@ fn apply_value(style: &mut LayoutStyle, name: &str, value: &str) {
             apply_font_size(style, value);
         }
         "letter-spacing" => apply_letter_spacing(style, value),
+        "word-spacing" => apply_word_spacing(style, value),
         "font" => apply_font_shorthand(style, value),
         "font-weight" => {
             let lower = value.trim().to_ascii_lowercase();
@@ -2164,6 +2185,7 @@ pub fn supports_declaration(name: &str, value: &str) -> bool {
             | "color-scheme"
             | "font-size"
             | "letter-spacing"
+            | "word-spacing"
             | "font"
             | "font-weight"
             | "font-family"
@@ -2323,6 +2345,10 @@ pub fn supports_declaration(name: &str, value: &str) -> bool {
                 | "flow-root"
                 | "table"
                 | "inline-table"
+                | "table-row"
+                | "table-row-group"
+                | "table-header-group"
+                | "table-footer-group"
                 | "-webkit-box"
                 | "-webkit-inline-box"
                 | "contents"
@@ -3008,6 +3034,7 @@ fn supports_conservative_known_value(name: &str, value: &str) -> bool {
     };
     match name {
         "width" | "inline-size" => lower == "fit-content" || dimension(value, true),
+        "word-spacing" => lower == "normal" || parse_word_spacing_length(value).is_some(),
         "height" | "block-size" | "min-width" | "min-inline-size" | "min-height"
         | "min-block-size" | "max-width" | "max-inline-size" | "max-height" | "max-block-size"
         | "flex-basis" => dimension(value, true),
@@ -7107,6 +7134,50 @@ fn apply_font_size(style: &mut LayoutStyle, value: &str) {
             style.font_size = None;
             style.font_size_raw = Some(rel);
         }
+    }
+}
+
+fn apply_word_spacing(style: &mut LayoutStyle, value: &str) {
+    let value = value.trim();
+    let lower = value.to_ascii_lowercase();
+    if matches!(lower.as_str(), "inherit" | "unset" | "revert" | "revert-layer") {
+        style.word_spacing = None;
+        style.word_spacing_raw = None;
+        return;
+    }
+    if matches!(lower.as_str(), "normal" | "initial") {
+        style.word_spacing = Some(0.0);
+        style.word_spacing_raw = None;
+        return;
+    }
+    // Invalid declarations must not replace an earlier cascade winner.
+    match parse_word_spacing_length(value) {
+        Some(crate::Dimension::Px(pixels)) => {
+            style.word_spacing = Some(pixels);
+            style.word_spacing_raw = None;
+        }
+        Some(relative) => {
+            style.word_spacing = None;
+            style.word_spacing_raw = Some(relative);
+        }
+        None => {}
+    }
+}
+
+fn parse_word_spacing_length(value: &str) -> Option<crate::Dimension> {
+    let mut input = cssparser::ParserInput::new(value);
+    let mut parser = cssparser::Parser::new(&mut input);
+    let length = match parser.next().ok()? {
+        cssparser::Token::Number { value, .. } if *value == 0.0 => crate::Dimension::Px(0.0),
+        cssparser::Token::Dimension { value, unit, .. } if value.is_finite() => {
+            dimension_value(&format!("{value}{unit}"))
+        }
+        _ => return None,
+    };
+    if !parser.is_exhausted() { return None; }
+    match length.resolve(16.0, 16.0, 1.0, 1.0) {
+        crate::Dimension::Px(pixels) if pixels.is_finite() => Some(length),
+        _ => None,
     }
 }
 
