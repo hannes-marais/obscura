@@ -3778,11 +3778,12 @@ impl ObscuraJsRuntime {
     /// asleep waiting for it.
     #[doc(hidden)]
     pub async fn run_autonomous_event_loop_turn(&mut self) -> Result<bool, String> {
-        // A real application task in the Decker PPTX Plan journey exceeded
-        // the generic 5.5 s synchronous-task allowance. Keep autonomous page
-        // work bounded, but allow a larger single application task to finish.
-        // This remains isolate-local; the page cannot stall another worker.
-        const AUTONOMOUS_TASK_WATCHDOG_MS: u64 = 20_000;
+        // Real Decker Plan work exceeded the generic 5.5 s synchronous-task
+        // allowance, and its 32-slide Check work also exceeded 20 s. Keep
+        // autonomous page work bounded, but allow a realistic application
+        // operation to finish. This remains isolate-local; the page cannot
+        // stall another worker.
+        const AUTONOMOUS_TASK_WATCHDOG_MS: u64 = 60_000;
 
         #[cfg(feature = "render")]
         self.service_render_resources();
@@ -6195,15 +6196,15 @@ mod tests {
     }
 
     #[tokio::test(flavor = "current_thread")]
-    async fn autonomous_watchdog_allows_a_six_second_page_task() {
+    async fn autonomous_watchdog_allows_a_twenty_five_second_page_task() {
         let mut rt = setup_runtime("<html><body></body></html>");
         rt.evaluate(r#"setTimeout(() => {
-            const deadline = Date.now() + 6_000;
+            const deadline = Date.now() + 25_000;
             while (Date.now() < deadline) {}
             globalThis.__longAutonomousTaskCompleted = true;
         }, 0)"#).unwrap();
 
-        tokio::time::timeout(std::time::Duration::from_secs(10), async {
+        tokio::time::timeout(std::time::Duration::from_secs(35), async {
             loop {
                 rt.run_autonomous_event_loop_turn().await.unwrap();
                 if rt.evaluate("globalThis.__longAutonomousTaskCompleted === true").unwrap()
@@ -6212,7 +6213,7 @@ mod tests {
                     break;
                 }
             }
-        }).await.expect("bounded page work above the former 5.5 s limit completes");
+        }).await.expect("bounded page work above the former watchdog limits completes");
 
         assert_eq!(rt.evaluate("1 + 1").unwrap().as_f64(), Some(2.0));
     }
