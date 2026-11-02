@@ -1097,6 +1097,20 @@ fn chrome_client_hints(ua: &str) -> (String, String) {
     (sec_ch_ua, platform.to_string())
 }
 
+/// How long a request may wait with no bytes arriving (headers or body)
+/// before it fails: reqwest's `read_timeout`, reset by every read. It bounds
+/// a stalled connection without cutting off a slow but live answer, such as a
+/// model completion that takes a minute (vm-78ui). 300 s is Firefox's
+/// `network.http.response.timeout`. `OBSCURA_FETCH_IDLE_TIMEOUT_MS` overrides.
+pub fn fetch_idle_timeout() -> Duration {
+    parse_fetch_idle_timeout(std::env::var("OBSCURA_FETCH_IDLE_TIMEOUT_MS").ok().as_deref())
+}
+
+pub fn parse_fetch_idle_timeout(value: Option<&str>) -> Duration {
+    value.and_then(|v| v.trim().parse::<u64>().ok()).filter(|ms| *ms > 0)
+        .map(Duration::from_millis).unwrap_or(Duration::from_secs(300))
+}
+
 impl ObscuraHttpClient {
     pub fn new() -> Self {
         Self::with_cookie_jar(Arc::new(CookieJar::new()))
@@ -1139,6 +1153,9 @@ impl ObscuraHttpClient {
                 .redirect(Policy::none())
                 .no_gzip().no_brotli().no_deflate()
                 .timeout(self.timeout)
+                // Navigation keeps its total above; scripted fetch/XHR on this
+                // pool replaces the total per request and relies on this.
+                .read_timeout(fetch_idle_timeout())
                 .danger_accept_invalid_certs(false)
                 // Read a folded header line (obs-fold) as browsers do instead of
                 // failing the response.

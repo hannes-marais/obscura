@@ -3437,22 +3437,24 @@ pub fn cached_request_client(proxy_url: Option<&str>) -> Result<reqwest::Client,
 }
 
 fn build_request_client(proxy_url: Option<&str>) -> Result<reqwest::Client, String> {
+    build_request_client_with(proxy_url, FetchDeadlines::from_env())
+}
+
+fn build_request_client_with(proxy_url: Option<&str>, deadlines: FetchDeadlines) -> Result<reqwest::Client, String> {
     // Redirects are followed manually below so each hop can be re-validated
     // against the same SSRF policy as the initial URL (GHSA-8v6v-g4rh-jmcm).
     // With reqwest's default auto-follow, an attacker-controlled origin can
     // 302 to http://127.0.0.1 and read the internal-service body.
-    // Per-request timeout so a scripted fetch()/XHR, or a CORS preflight OPTIONS
-    // (issue #251), to a server that accepts the connection but never responds
-    // cannot hang forever. Without it op_fetch_url never returns, the fetch
-    // promise never settles, and the JS XHR is stuck at readyState 1 with no
-    // completion event (which stranded Angular HttpClient). On timeout reqwest's
-    // send().await errors, which op_fetch_url propagates and the fetch shim turns
-    // into an XHR `error`/`loadend`. 30s matches the other clients in the
-    // workspace; OBSCURA_FETCH_TIMEOUT_MS overrides it for tighter cloud limits.
+    // A scripted fetch()/XHR, or a CORS preflight OPTIONS (issue #251), to a
+    // server that accepts the connection but never responds must not hang
+    // forever: op_fetch_url would never return and the XHR would sit at
+    // readyState 1 with no completion event (which stranded Angular
+    // HttpClient). The idle deadline settles it; see FetchDeadlines.
     let mut builder = reqwest::Client::builder()
         .redirect(reqwest::redirect::Policy::none())
         .no_gzip().no_brotli().no_deflate()
-        .timeout(fetch_timeout())
+        .read_timeout(deadlines.idle)
+        .timeout(deadlines.request_timeout())
         // SSRF guard: also reject hostnames that resolve to a private/loopback IP.
         .dns_resolver(std::sync::Arc::new(obscura_net::SsrfGuardResolver::new(
             false,
@@ -3473,12 +3475,45 @@ fn build_request_client(proxy_url: Option<&str>) -> Result<reqwest::Client, Stri
         .map_err(|e| format!("failed to build reqwest::Client: {}", e))
 }
 
-fn fetch_timeout() -> std::time::Duration {
-    let timeout_ms = std::env::var("OBSCURA_FETCH_TIMEOUT_MS")
-        .ok()
-        .and_then(|s| s.parse().ok())
-        .unwrap_or(30_000);
-    std::time::Duration::from_millis(timeout_ms)
+/// Deadlines for scripted fetch()/XHR and CORS preflights, shaped like a
+/// browser's. No browser gives fetch() a total deadline; Obscura's former 30 s
+/// total failed every live answer slower than that, e.g. a Decker Read whose
+/// model call takes 30-60 s (vm-78ui: three attempts, each paid upstream and
+/// discarded). A stalled request is bounded by `idle` (no bytes for that
+/// long, while waiting for headers or between body chunks). `total` applies
+/// only when `OBSCURA_FETCH_TIMEOUT_MS` is set, for deployments that want a
+/// hard cap.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct FetchDeadlines {
+    idle: std::time::Duration,
+    total: Option<std::time::Duration>,
+}
+
+/// Replaces the page client's navigation total on scripted requests when no
+/// total is configured; the idle deadline is what bounds them.
+const FETCH_TOTAL_BACKSTOP: std::time::Duration = std::time::Duration::from_secs(24 * 60 * 60);
+
+impl FetchDeadlines {
+    fn from_env() -> FetchDeadlines {
+        FetchDeadlines::parse(
+            std::env::var("OBSCURA_FETCH_TIMEOUT_MS").ok().as_deref(),
+            std::env::var("OBSCURA_FETCH_IDLE_TIMEOUT_MS").ok().as_deref(),
+        )
+    }
+
+    fn parse(total_ms: Option<&str>, idle_ms: Option<&str>) -> FetchDeadlines {
+        FetchDeadlines {
+            idle: obscura_net::client::parse_fetch_idle_timeout(idle_ms),
+            total: total_ms.and_then(|v| v.trim().parse::<u64>().ok()).filter(|ms| *ms > 0)
+                .map(std::time::Duration::from_millis),
+        }
+    }
+
+    /// The per-request total: it overrides the client's, so the page client's
+    /// 30 s navigation total never applies to fetch()/XHR.
+    fn request_timeout(&self) -> std::time::Duration {
+        self.total.unwrap_or(FETCH_TOTAL_BACKSTOP)
+    }
 }
 
 /// Cap on the number of redirect hops op_fetch_url will follow.
@@ -4198,7 +4233,7 @@ async fn fetch_url_inner(
     if needs_preflight {
         let mut preflight_request = client
             .request(reqwest::Method::OPTIONS, &url)
-            .timeout(fetch_timeout())
+            .timeout(FetchDeadlines::from_env().request_timeout())
             .header("Origin", &page_origin)
             .header("Access-Control-Request-Method", method.as_str());
         if !unsafe_header_names.is_empty() {
@@ -4321,7 +4356,7 @@ async fn fetch_url_inner(
     let response = loop {
         let mut req = client
             .request(current_method.clone(), &current_url)
-            .timeout(fetch_timeout());
+            .timeout(FetchDeadlines::from_env().request_timeout());
 
         let current_is_cross_origin = request_origin(&current_url)
             .map(|request_origin| request_origin != page_origin)
@@ -4914,6 +4949,89 @@ mod tests {
         assert!(detail.contains("timeout=false connect=false"), "{detail}");
         assert!(detail.contains("source:"), "The underlying cause must survive: {detail}");
         assert!(!detail.contains("PRIVATE_PASSWORD") && !detail.contains("PRIVATE_TOKEN"), "{detail}");
+    }
+
+    /// A local server that waits `pause` before the headers and between each
+    /// body chunk (like a model call that is slow but alive), or never
+    /// answers when `chunks` is empty.
+    fn slow_server(pause: std::time::Duration, chunks: &'static [&'static str]) -> String {
+        use std::io::{BufRead, Write};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let url = format!("http://{}/v1/chat/completions", listener.local_addr().unwrap());
+        std::thread::spawn(move || {
+            for stream in listener.incoming() {
+                let Ok(mut stream) = stream else { return };
+                std::thread::spawn(move || {
+                    let mut reader = std::io::BufReader::new(stream.try_clone().unwrap());
+                    let mut line = String::new();
+                    while reader.read_line(&mut line).map(|n| n > 0).unwrap_or(false) && line != "\r\n" {
+                        line.clear();
+                    }
+                    if chunks.is_empty() {
+                        std::thread::sleep(std::time::Duration::from_secs(30));
+                        return;
+                    }
+                    std::thread::sleep(pause);
+                    let _ = stream.write_all(b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nTransfer-Encoding: chunked\r\n\r\n");
+                    for chunk in chunks {
+                        std::thread::sleep(pause);
+                        let _ = write!(stream, "{:x}\r\n{chunk}\r\n", chunk.len());
+                        let _ = stream.flush();
+                    }
+                    let _ = stream.write_all(b"0\r\n\r\n");
+                });
+            }
+        });
+        url
+    }
+
+    // vm-78ui: a Read model call answered after Obscura's old 30 s whole-request
+    // deadline and was discarded on every attempt. Scaled down: the answer takes
+    // 3 x 400 ms = 1.2 s, beyond a 1 s total, with no gap over the 1 s idle.
+    #[tokio::test]
+    async fn fetch_deadline_is_idle_not_total() {
+        use std::time::Duration;
+        let pause = Duration::from_millis(400);
+        let idle = Duration::from_millis(1000);
+        let fetch = |client: reqwest::Client, deadlines: super::FetchDeadlines, url: String| async move {
+            client.post(&url).timeout(deadlines.request_timeout()).send().await?.text().await
+        };
+
+        let deadlines = super::FetchDeadlines { idle, total: None };
+        let client = super::build_request_client_with(None, deadlines).unwrap();
+        let body = fetch(client, deadlines, slow_server(pause, &["{\"ok\":", "true}"])).await.unwrap();
+        assert_eq!(body, "{\"ok\":true}");
+
+        // The page client carries a navigation total; the per-request deadline replaces it.
+        let page_client = reqwest::Client::builder().timeout(idle).read_timeout(idle).build().unwrap();
+        let body = fetch(page_client, deadlines, slow_server(pause, &["{\"ok\":", "true}"])).await.unwrap();
+        assert_eq!(body, "{\"ok\":true}");
+
+        // The old shape, a whole-request deadline, fails the same live answer.
+        let old = super::FetchDeadlines { idle, total: Some(idle) };
+        let client = super::build_request_client_with(None, old).unwrap();
+        let error = fetch(client, old, slow_server(pause, &["{\"ok\":", "true}"])).await.unwrap_err();
+        assert!(error.is_timeout(), "{error:?}");
+
+        // A server that accepts and never answers (#251) still settles, at the idle deadline.
+        let client = super::build_request_client_with(None, deadlines).unwrap();
+        let started = std::time::Instant::now();
+        let error = fetch(client, deadlines, slow_server(pause, &[])).await.unwrap_err();
+        assert!(error.is_timeout(), "{error:?}");
+        assert!(started.elapsed() < Duration::from_secs(5), "{:?}", started.elapsed());
+    }
+
+    #[test]
+    fn fetch_deadline_defaults_fit_a_slow_model_call() {
+        let defaults = super::FetchDeadlines::parse(None, None);
+        assert_eq!(defaults.idle, std::time::Duration::from_secs(300));
+        assert_eq!(defaults.total, None);
+        assert!(defaults.request_timeout() > std::time::Duration::from_secs(3600));
+        let capped = super::FetchDeadlines::parse(Some("20000"), Some("45000"));
+        assert_eq!(capped.total, Some(std::time::Duration::from_secs(20)));
+        assert_eq!(capped.request_timeout(), std::time::Duration::from_secs(20));
+        assert_eq!(capped.idle, std::time::Duration::from_secs(45));
+        assert_eq!(super::FetchDeadlines::parse(Some("junk"), Some("0")), defaults);
     }
 
     // #678: Web Storage lives in Rust, keyed by origin, so these pin the

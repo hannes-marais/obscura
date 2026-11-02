@@ -460,7 +460,7 @@ Modules that enhance an already-rendered page have a separate 3s per-module budg
 OBSCURA_MODULE_BUDGET_MS=10000 obscura serve --port 9222
 ```
 
-An unmounted SPA shell already gives its app modules the full `OBSCURA_SCRIPT_DEADLINE_MS` budget. `OBSCURA_FETCH_TIMEOUT_MS` controls the module's network request, not its evaluation time. See [Environment variables](docs/Environment-variables.md) for the complete timeout model.
+An unmounted SPA shell already gives its app modules the full `OBSCURA_SCRIPT_DEADLINE_MS` budget. `OBSCURA_FETCH_IDLE_TIMEOUT_MS` (and `OBSCURA_FETCH_TIMEOUT_MS`, when set) control the module's network request, not its evaluation time. See [Environment variables](docs/Environment-variables.md) for the complete timeout model.
 
 ### `obscura serve`
 

@@ -50,7 +50,7 @@ Per-module graph-loading and evaluation budget for modules that enhance an alrea
 OBSCURA_MODULE_BUDGET_MS=10000 obscura serve
 ```
 
-This shorter budget applies when the document body already contains more than 50 descendant nodes, where modules are normally progressive enhancement and should not delay navigation indefinitely. For an unmounted SPA shell, Obscura instead gives each module the full `OBSCURA_SCRIPT_DEADLINE_MS` budget so the app has time to mount. Module network requests remain independently bounded by `OBSCURA_FETCH_TIMEOUT_MS`.
+This shorter budget applies when the document body already contains more than 50 descendant nodes, where modules are normally progressive enhancement and should not delay navigation indefinitely. For an unmounted SPA shell, Obscura instead gives each module the full `OBSCURA_SCRIPT_DEADLINE_MS` budget so the app has time to mount. Module network requests remain independently bounded by `OBSCURA_FETCH_IDLE_TIMEOUT_MS` (and `OBSCURA_FETCH_TIMEOUT_MS`, when set).
 
 ### `OBSCURA_CDP_COMMAND_TIMEOUT_MS`
 
@@ -70,9 +70,17 @@ bytes. Pass it as `Authorization: Bearer <token>` in the CDP client's headers.
 OBSCURA_CDP_TOKEN="$(openssl rand -hex 32)" obscura serve --host 0.0.0.0
 ```
 
+### `OBSCURA_FETCH_IDLE_TIMEOUT_MS`
+
+Idle deadline for scripted `fetch()`, `XMLHttpRequest`, and ES-module loads: the request fails when no bytes arrive for this long, while waiting for the response headers or between body chunks. It is what settles a request to a server that accepts the connection but never responds (including a CORS preflight), which would otherwise leave the XHR stuck with no completion event. A slow but live answer, such as a model completion that takes a minute, is not cut off. Default 300000 (300 seconds, Firefox's `network.http.response.timeout`).
+
+```bash
+OBSCURA_FETCH_IDLE_TIMEOUT_MS=120000 obscura serve
+```
+
 ### `OBSCURA_FETCH_TIMEOUT_MS`
 
-Request timeout for scripted `fetch()`, `XMLHttpRequest`, and ES-module loads. Without it a request to a server that accepts the connection but never responds (including a CORS preflight) hangs forever and the XHR is stuck with no completion event. Default 30000 (30 seconds).
+Optional total deadline for scripted `fetch()`, `XMLHttpRequest`, and ES-module loads. Unset by default: like a desktop browser, Obscura puts no total deadline on `fetch()`, and the idle deadline above bounds a stalled request. Set it when a deployment wants a hard cap per request.
 
 ```bash
 OBSCURA_FETCH_TIMEOUT_MS=15000 obscura serve
