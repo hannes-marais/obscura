@@ -6723,6 +6723,9 @@ class HTMLImageElement extends Element {
   }
   set src(value) { this.setAttribute("src", value); }
 
+  get alt() { return this.getAttribute("alt") ?? ""; }
+  set alt(value) { this.setAttribute("alt", String(value)); }
+
   get currentSrc() {
     this._refreshImageFromCache();
     this._queueImageRequest();
