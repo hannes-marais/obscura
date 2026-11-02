@@ -3778,8 +3778,11 @@ impl ObscuraJsRuntime {
     /// asleep waiting for it.
     #[doc(hidden)]
     pub async fn run_autonomous_event_loop_turn(&mut self) -> Result<bool, String> {
-        const AUTONOMOUS_TASK_WATCHDOG_MS: u64 =
-            SYNCHRONOUS_TASK_FLOOR_MS + WATCHDOG_SCHEDULING_MARGIN_MS;
+        // A real application task in the Decker PPTX Plan journey exceeded
+        // the generic 5.5 s synchronous-task allowance. Keep autonomous page
+        // work bounded, but allow a larger single application task to finish.
+        // This remains isolate-local; the page cannot stall another worker.
+        const AUTONOMOUS_TASK_WATCHDOG_MS: u64 = 20_000;
 
         #[cfg(feature = "render")]
         self.service_render_resources();
@@ -6188,6 +6191,29 @@ mod tests {
         assert!(exceptions[0].description.contains(&error));
         assert!(!exceptions[0].url.is_empty());
         assert!(exceptions[0].timestamp > 0.0);
+        assert_eq!(rt.evaluate("1 + 1").unwrap().as_f64(), Some(2.0));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn autonomous_watchdog_allows_a_six_second_page_task() {
+        let mut rt = setup_runtime("<html><body></body></html>");
+        rt.evaluate(r#"setTimeout(() => {
+            const deadline = Date.now() + 6_000;
+            while (Date.now() < deadline) {}
+            globalThis.__longAutonomousTaskCompleted = true;
+        }, 0)"#).unwrap();
+
+        tokio::time::timeout(std::time::Duration::from_secs(10), async {
+            loop {
+                rt.run_autonomous_event_loop_turn().await.unwrap();
+                if rt.evaluate("globalThis.__longAutonomousTaskCompleted === true").unwrap()
+                    == serde_json::json!(true)
+                {
+                    break;
+                }
+            }
+        }).await.expect("bounded page work above the former 5.5 s limit completes");
+
         assert_eq!(rt.evaluate("1 + 1").unwrap().as_f64(), Some(2.0));
     }
 
