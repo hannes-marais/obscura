@@ -117,3 +117,16 @@ and then `runCompose("review-deck")`; that Compose graph includes a
 to `CheckDeck()` alone and is consistent with the separate review flow, but the
 browser action sequence linking them is not in the capture. Do not treat this
 as identification of the V8 task or of the blocking phase.
+
+## Profiling constraint
+
+ArchieQL shows the indexed Obscura CDP dispatcher treats `Profiler` commands as
+no-ops, and the focused synthetic watchdog test confirms V8 returns no JS frames
+for a synchronous infinite loop. An opt-in prototype using deno_core's local
+InspectorSession and `Profiler.start/stop` SIGSEGVs in the release watchdog test
+before it can produce a profile; the prototype was removed. Do not enable the
+inspector in the runtime as a workaround. Governing principles remain 4, 7, 18,
+35 and 36. Next viable route is bounded phase timing in the Decker review flow,
+or a separately validated V8 sampling interface that does not crash against
+Obscura's startup snapshot. Any real Check retry still waits for the prior job
+to be confirmed terminal.
