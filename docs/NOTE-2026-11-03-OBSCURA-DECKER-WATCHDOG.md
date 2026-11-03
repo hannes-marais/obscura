@@ -92,8 +92,19 @@ and report any V8 error frames returned at termination. ToT: preserve source
 location and stack only when V8 provides them; keep the generic watchdog error
 when it does not. The runtime exception is already a CDP-visible page event.
 
-Owned files: `crates/obscura-js/src/runtime.rs` and `src/ops.rs`. Validation
+Owned files: `crates/obscura-js/src/runtime.rs` and
+`crates/obscura-js/src/ops.rs`. Validation
 plan: focused release nextest for the autonomous watchdog, release build, then
 an isolated real Check journey only after the prior DOSVR job is known terminal.
 The documented `CARGO_INCREMENTAL=0 CARGO_BUILD_JOBS=2 cargo build --release
 -p obscura-cli --bins --features render` succeeds with this diagnostic change.
+
+The focused watchdog nextest passes termination and isolate recovery. A stronger
+assertion requiring source frames fails for the synthetic infinite loop: V8
+returns execution termination without a `JsError` stack. The new propagation
+therefore preserves frames when V8 returns them, but does not attribute a
+non-yielding loop. The earlier Check job still has no captured final state, so
+do not retry it. Next diagnostic path must sample the isolate while it is
+running or capture bounded phase timing in the app; the 20-second worker bound
+remains unchanged. This is direct evidence against treating post-termination
+exception propagation as sufficient watchdog attribution.
