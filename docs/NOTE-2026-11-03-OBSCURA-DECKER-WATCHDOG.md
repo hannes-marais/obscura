@@ -78,3 +78,22 @@ previously validated 20-second watchdog and six-second allowance regression.
 Focused release nextest `ad04a7a9-72be-462e-ae3e-04fa7c48a6be` passes both the
 six-second task and watchdog termination/recovery cases (2 passed). The actual
 Check remains unverified on Obscura; the 20-second failure remains open.
+
+## 2026-11-03 Diagnostic update
+
+ArchieQL snapshot `b7ac6c7726014eddc96850042c48b4fee0926a99` contained the
+unverified 60-second candidate; live `e693576` has restored the 20-second
+limit. Both inspected versions discard `poll_event_loop`'s error on watchdog
+termination and record `ObscuraTaskError` with an empty stack trace. The exact
+Check task is still unknown. Architecture principles 7 (observable bounded
+failure), 18 (input-scaled work), 35 (real journey), and 36 (evidence-based
+budgets) govern this diagnostic change. ToQ: retain the 20-second hard ceiling
+and report any V8 error frames returned at termination. ToT: preserve source
+location and stack only when V8 provides them; keep the generic watchdog error
+when it does not. The runtime exception is already a CDP-visible page event.
+
+Owned files: `crates/obscura-js/src/runtime.rs` and `src/ops.rs`. Validation
+plan: focused release nextest for the autonomous watchdog, release build, then
+an isolated real Check journey only after the prior DOSVR job is known terminal.
+The documented `CARGO_INCREMENTAL=0 CARGO_BUILD_JOBS=2 cargo build --release
+-p obscura-cli --bins --features render` succeeds with this diagnostic change.

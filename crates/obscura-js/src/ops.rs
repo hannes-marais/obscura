@@ -3467,11 +3467,36 @@ pub(crate) fn record_uncaught_exception(
 // observable, bounded queue as JavaScript exceptions. Stderr alone is not a
 // runtime-error receipt for CDP clients such as WebPilot.
 pub(crate) fn record_autonomous_task_failure(state: &mut ObscuraState, message: &str) {
-    let url = state.url.clone();
+    record_autonomous_task_failure_with_js_error(state, message, None);
+}
+
+pub(crate) fn record_autonomous_task_failure_with_js_error(
+    state: &mut ObscuraState,
+    message: &str,
+    error: Option<&deno_core::error::JsError>,
+) {
+    let fallback_url = state.url.clone();
+    let first = error.and_then(|error| error.frames.first());
+    let url = first.and_then(|frame| frame.file_name.clone())
+        .filter(|url| !url.is_empty()).unwrap_or_else(|| fallback_url.clone());
+    let line_number = first.and_then(|frame| frame.line_number).unwrap_or(1).saturating_sub(1);
+    let column_number = first.and_then(|frame| frame.column_number).unwrap_or(1).saturating_sub(1);
+    let stack_trace = error.into_iter().flat_map(|error| error.frames.iter()).map(|frame| {
+        serde_json::json!({
+            "functionName": frame.function_name.as_deref().unwrap_or(""),
+            "scriptId": "",
+            "url": frame.file_name.as_deref().unwrap_or(&fallback_url),
+            "lineNumber": frame.line_number.unwrap_or(1).saturating_sub(1),
+            "columnNumber": frame.column_number.unwrap_or(1).saturating_sub(1),
+        })
+    }).collect();
+    let description = match error.and_then(|error| error.stack.as_deref()) {
+        Some(stack) => format!("ObscuraTaskError: {message}\n{stack}"),
+        None => format!("ObscuraTaskError: {message}"),
+    };
     enqueue_runtime_exception(state, RuntimeExceptionEvent {
         exception_id: 0, name: "ObscuraTaskError".into(),
-        description: format!("ObscuraTaskError: {message}"), url,
-        line_number: 0, column_number: 0, stack_trace: Vec::new(), timestamp: 0.0,
+        description, url, line_number, column_number, stack_trace, timestamp: 0.0,
     });
 }
 

@@ -3809,6 +3809,7 @@ impl ObscuraJsRuntime {
 
         let isolate_handle = self.isolate_handle();
         let mut waiting_for_wake = false;
+        let mut watchdog_reported = false;
         let result = std::future::poll_fn(|cx| {
             let task_generation = self.state.borrow().animation_task_generation;
             let watchdog = crate::cdp_watchdog::arm(
@@ -3820,10 +3821,22 @@ impl ObscuraJsRuntime {
                 .poll_event_loop(cx, deno_core::PollEventLoopOptions::default());
             let watchdog_fired = crate::cdp_watchdog::disarm(watchdog);
             if watchdog_fired {
+                watchdog_reported = true;
                 self.runtime().v8_isolate().cancel_terminate_execution();
-                return std::task::Poll::Ready(Err(format!(
+                let message = format!(
                     "autonomous browser task exceeded its task budget ({AUTONOMOUS_TASK_WATCHDOG_MS}ms)",
-                )));
+                );
+                let js_error = match &tick {
+                    std::task::Poll::Ready(Err(error)) => match error.0.as_ref() {
+                        deno_core::error::CoreErrorKind::Js(error) => Some(error.as_ref()),
+                        _ => None,
+                    },
+                    _ => None,
+                };
+                crate::ops::record_autonomous_task_failure_with_js_error(
+                    &mut self.state.borrow_mut(), &message, js_error,
+                );
+                return std::task::Poll::Ready(Err(message));
             }
             if self.has_ready_cdp_evaluations() || self.has_pending_frame_tasks() {
                 return std::task::Poll::Ready(Ok(false));
@@ -3859,8 +3872,10 @@ impl ObscuraJsRuntime {
             tokio::task::yield_now().await;
         }
         let result = self.finish_heap_checked(result);
-        if let Err(message) = &result {
-            crate::ops::record_autonomous_task_failure(&mut self.state.borrow_mut(), message);
+        if !watchdog_reported {
+            if let Err(message) = &result {
+                crate::ops::record_autonomous_task_failure(&mut self.state.borrow_mut(), message);
+            }
         }
         result
     }
