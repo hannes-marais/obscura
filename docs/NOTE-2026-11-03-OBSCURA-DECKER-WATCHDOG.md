@@ -54,5 +54,27 @@ polling continued afterward. The persisted deck still showed an enabled
 unknown. The owner stopped only the browser runner after five settled
 Dossier-only poll pairs and stopped only its isolated server. The VPM task was
 returned to bug status; no Check retry has been launched. The runtime bound is
-now being raised to 60 seconds based on this workload and the prior real
-45-second Chromium Check, while remaining bounded per isolate.
+kept at 20 seconds for now. A 60-second candidate was committed as `b7ac6c7`
+but not built or deployed; review identified that it would only prolong a
+non-yielding page task without showing the operation that blocks. Its full
+release test build was stopped before tests ran. A V8 `request_interrupt` stack
+sampler was prototyped against the existing 20-second watchdog, but the focused
+infinite-task regression did not receive the callback before termination, even
+with a five-second sampling window; that diagnostic was removed. The Check
+repro's `Check the deck` click is followed by a 116.382-second WebPilot
+`waitFor`; it ended with `browser stopped answering: Interrupted system call`
+when the owner stopped the runner after polling had gone silent. That error is
+not independent evidence of a WebPilot propagation defect. The reliable
+finding is that the 20-second Obscura watchdog fires and DOSVR event polling
+ceases, with no Check results visible. Next use an isolate CPU profiler or
+app-level bounded phase timing to identify the synchronous Check function.
+Preserve the 20-second worker bound and do not retry while the prior backend
+job state is unknown. The
+WebPilot-to-Obscura CDP link is WebSocket; Decker's DOSVR calls are HTTP POST
+fetches and job polling.
+
+After rejecting the unverified 60-second candidate, the source is back at the
+previously validated 20-second watchdog and six-second allowance regression.
+Focused release nextest `ad04a7a9-72be-462e-ae3e-04fa7c48a6be` passes both the
+six-second task and watchdog termination/recovery cases (2 passed). The actual
+Check remains unverified on Obscura; the 20-second failure remains open.
