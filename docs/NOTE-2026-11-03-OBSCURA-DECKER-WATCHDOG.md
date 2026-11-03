@@ -108,3 +108,12 @@ do not retry it. Next diagnostic path must sample the isolate while it is
 running or capture bounded phase timing in the app; the 20-second worker bound
 remains unchanged. This is direct evidence against treating post-termination
 exception propagation as sufficient watchdog attribution.
+
+ArchieQL snapshot `6230d4e1` also indexed `appgen-projects` source for the
+Decker path. `CheckDeck()` itself only prepares the Review workspace and
+navigates to it. The separate `RunReview()` flow calls `renderBlockDeck(...)`
+and then `runCompose("review-deck")`; that Compose graph includes a
+`VerdictCheck` node. The capture's `SubmitTurn` therefore cannot be attributed
+to `CheckDeck()` alone and is consistent with the separate review flow, but the
+browser action sequence linking them is not in the capture. Do not treat this
+as identification of the V8 task or of the blocking phase.
