@@ -4828,6 +4828,8 @@ class Element extends Node {
       if (link) {
         const href = link.getAttribute('href');
         if (href && !href.startsWith('javascript:')) {
+          // <a download> downloads the resource instead of navigating to it.
+          if (link.hasAttribute('download')) { _downloadHyperlink(link); return; }
           location.assign(href);
           return;
         }
@@ -8809,6 +8811,35 @@ function _serializeBody(initBody, headers, synthesizeContentType = true) {
 // Object URLs are runtime-local byte references, not HTTP requests. Keep the
 // snapshots private; the separate Worker registry retains decoded script text.
 const _objectURLBlobs = new Map();
+
+// HTML "downloads a hyperlink": an activated <a download> hands the resource's
+// bytes and suggested name to the host, which applies the browser context's
+// download behavior (Browser.setDownloadBehavior) and reports
+// Browser.downloadWillBegin / downloadProgress. The page is not navigated.
+// A blob: URL is read from the object URL registry at activation, as a revoke
+// right after click() must not lose it; data: and http(s) are fetched.
+function _downloadBasename(name) {
+  return String(name).replace(/[\x00-\x1f\x7f]/g, '').split(/[\/\\]/).pop().trim().replace(/^\.+/, '').slice(0, 255);
+}
+function _downloadHyperlink(link) {
+  let url;
+  try { url = new URL(link.getAttribute('href'), document.baseURI || location.href).href; } catch (e) { return; }
+  const named = _downloadBasename(link.getAttribute('download') || '');
+  const send = (bytes, name) => {
+    try { __obscuraCore.ops.op_request_download(url, name || 'download', bytes); } catch (e) {}
+  };
+  if (url.startsWith('blob:')) {
+    const blob = _objectURLBlobs.get(url);
+    if (blob && blob._bytes instanceof Uint8Array) send(blob._bytes, named);
+    return;
+  }
+  let fromPath = '';
+  try { fromPath = _downloadBasename(decodeURIComponent(new URL(url).pathname.split('/').pop() || '')); } catch (e) {}
+  fetch(url)
+    .then((response) => (response.ok ? response.arrayBuffer() : null))
+    .then((buffer) => { if (buffer) send(new Uint8Array(buffer), named || fromPath); })
+    .catch(() => {});
+}
 const _requestHeaderGuards = new WeakSet();
 const _forbiddenRequestHeaderNames = new Set([
   'accept-charset', 'accept-encoding', 'access-control-request-headers',

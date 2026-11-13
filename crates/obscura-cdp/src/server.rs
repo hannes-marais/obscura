@@ -1269,6 +1269,7 @@ async fn cdp_processor(
             runtime_pump_armed = ctx.pages.iter().any(|page| page.has_js());
             dispatch::drain_runtime_events(&mut ctx);
             dispatch::drain_binding_calls(&mut ctx);
+            dispatch::drain_downloads(&mut ctx);
             dispatch::drain_frame_events(&mut ctx);
             forward_pending_events(&mut ctx, Some(&pending.reply_tx));
             let response = match result {
@@ -1320,6 +1321,7 @@ async fn cdp_processor(
                     sync_live_page_background_events(&mut ctx);
                     dispatch::drain_runtime_events(&mut ctx);
                     dispatch::drain_binding_calls(&mut ctx);
+                    dispatch::drain_downloads(&mut ctx);
                     dispatch::drain_frame_events(&mut ctx);
                     forward_pending_events(&mut ctx, connection_reply_tx.as_ref());
                     if let (Some(reply_tx), Some((session_id, url, method, body))) = (
@@ -2344,7 +2346,9 @@ fn fast_path_response(text: &str) -> Option<String> {
                 "jsVersion": "14.5.0.0",
             }))
         }
-        "Browser.setDownloadBehavior" | "Browser.getWindowBounds" => {
+        // Browser.setDownloadBehavior changes per-context state and goes to
+        // the dispatcher (domains/browser.rs), never acknowledged here.
+        "Browser.getWindowBounds" => {
             Some(json!({}))
         }
         _ => None,

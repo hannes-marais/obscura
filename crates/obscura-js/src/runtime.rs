@@ -1438,6 +1438,10 @@ impl ObscuraJsRuntime {
         std::mem::take(&mut self.state.borrow_mut().pending_binding_calls)
     }
 
+    pub fn take_pending_downloads(&self) -> Vec<crate::ops::PendingDownload> {
+        std::mem::take(&mut self.state.borrow_mut().pending_downloads)
+    }
+
     pub fn take_pending_runtime_events(&mut self) -> Vec<RuntimeEvent> {
         let events: Vec<_> = self
             .state

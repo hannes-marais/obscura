@@ -5024,6 +5024,14 @@ impl Page {
         }
     }
 
+    pub fn take_pending_downloads(&self) -> Vec<obscura_js::ops::PendingDownload> {
+        if let Some(js) = &self.js {
+            js.take_pending_downloads()
+        } else {
+            Vec::new()
+        }
+    }
+
     pub fn take_pending_runtime_events(&mut self) -> Vec<obscura_js::ops::RuntimeEvent> {
         if let Some(js) = &mut self.js {
             js.take_pending_runtime_events()

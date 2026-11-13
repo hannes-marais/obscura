@@ -9,6 +9,16 @@ use crate::domains;
 use crate::domains::fetch::FetchInterceptState;
 use crate::types::{CdpEvent, CdpRequest, CdpResponse};
 
+/// One browser context's Browser.setDownloadBehavior.
+#[derive(Clone, Debug)]
+pub(crate) struct DownloadBehavior {
+    /// `allow` writes the suggested name, `allowAndName` the download's guid;
+    /// `deny` and `default` write nothing.
+    pub behavior: String,
+    pub path: Option<std::path::PathBuf>,
+    pub events: bool,
+}
+
 pub(crate) const LIFECYCLE_PHASES: [&str; 5] = [
     "commit", "DOMContentLoaded", "load", "networkAlmostIdle", "networkIdle",
 ];
@@ -77,6 +87,9 @@ pub struct CdpContext {
     next_screencast_session_id: i64,
     pub default_context: Arc<BrowserContext>,
     pub browser_contexts: HashMap<String, Arc<BrowserContext>>,
+    /// Browser.setDownloadBehavior per browser context id. A context without
+    /// an entry writes nothing: there is no default download directory.
+    pub(crate) download_behaviors: HashMap<String, DownloadBehavior>,
     page_counter: u32,
     browser_context_counter: u32,
     target_session_counter: u64,
@@ -198,6 +211,7 @@ impl CdpContext {
             next_screencast_session_id: 0,
             default_context,
             browser_contexts: HashMap::new(),
+            download_behaviors: HashMap::new(),
             page_counter: 0,
             browser_context_counter: 0,
             target_session_counter: 0,
@@ -845,7 +859,7 @@ pub(crate) async fn dispatch_with_deferred(
 
     let result = match domain {
         "Target" => domains::target::handle(method, &req.params, ctx, &req.session_id).await,
-        "Browser" => domains::browser::handle(method, &req.params).await,
+        "Browser" => domains::browser::handle(method, &req.params, ctx).await,
         "Page" => domains::page::handle(method, &req.params, ctx, &req.session_id).await,
         "DOM" => domains::dom::handle(method, &req.params, ctx, &req.session_id).await,
         "DOMSnapshot" => {
@@ -916,6 +930,7 @@ pub(crate) async fn dispatch_with_deferred(
 
     drain_runtime_events(ctx);
     drain_binding_calls(ctx);
+    drain_downloads(ctx);
     drain_frame_events(ctx);
 
     match result {
@@ -1039,6 +1054,103 @@ pub(crate) fn drain_runtime_events(ctx: &mut CdpContext) {
 // connected client. Called after every dispatch — binding calls only land
 // in the queue while V8 is running inside a CDP handler, so there is no
 // window in which they could pile up without a draining opportunity.
+/// Downloads the pages started (`<a download>`), applied under their browser
+/// context's download behavior. Under `allow`/`allowAndName` the bytes are
+/// written as `<name>.crdownload` and renamed into place, so a file under its
+/// final name is complete; with `eventsEnabled` the browser-level
+/// Browser.downloadWillBegin and Browser.downloadProgress are reported, as
+/// Chrome reports them (no session). A context without a policy, or with
+/// `deny`/`default`, writes nothing and reports nothing.
+pub(crate) fn drain_downloads(ctx: &mut CdpContext) {
+    let mut drained = Vec::new();
+    for page in &mut ctx.pages {
+        let downloads = page.take_pending_downloads();
+        if !downloads.is_empty() {
+            drained.push((page.context.id.clone(), page.frame_id.clone(), downloads));
+        }
+    }
+    for (context_id, frame_id, downloads) in drained {
+        let Some(policy) = ctx.download_behaviors.get(&context_id).cloned() else {
+            continue;
+        };
+        let Some(directory) = policy.path.clone() else {
+            continue;
+        };
+        if !matches!(policy.behavior.as_str(), "allow" | "allowAndName") {
+            continue;
+        }
+        for download in downloads {
+            let guid = uuid::Uuid::new_v4().to_string();
+            let total = download.bytes.len() as u64;
+            if policy.events {
+                ctx.pending_events.push(CdpEvent {
+                    method: "Browser.downloadWillBegin".into(),
+                    params: json!({
+                        "frameId": frame_id,
+                        "guid": guid,
+                        "url": download.url,
+                        "suggestedFilename": download.suggested_filename,
+                    }),
+                    session_id: None,
+                });
+            }
+            let written = write_download(
+                &directory,
+                if policy.behavior == "allowAndName" { &guid } else { &download.suggested_filename },
+                &download.bytes,
+            );
+            if let Err(error) = &written {
+                tracing::warn!("download - writing {} failed: {error}", download.url);
+            }
+            if policy.events {
+                let ok = written.is_ok();
+                ctx.pending_events.push(CdpEvent {
+                    method: "Browser.downloadProgress".into(),
+                    params: json!({
+                        "guid": guid,
+                        "totalBytes": total,
+                        "receivedBytes": if ok { total } else { 0 },
+                        "state": if ok { "completed" } else { "canceled" },
+                    }),
+                    session_id: None,
+                });
+            }
+        }
+    }
+}
+
+/// Write one download into `directory` under `name` (a free variant
+/// `name (n).ext` when taken), through a `.crdownload` file renamed into place.
+fn write_download(directory: &std::path::Path, name: &str, bytes: &[u8]) -> std::io::Result<std::path::PathBuf> {
+    use std::io::Write;
+    let name = if name.is_empty() || name.contains(['/', '\\']) || name.starts_with('.') { "download" } else { name };
+    let (stem, extension) = match name.rsplit_once('.') {
+        Some((stem, extension)) if !stem.is_empty() => (stem, format!(".{extension}")),
+        _ => (name, String::new()),
+    };
+    for attempt in 0..100 {
+        let candidate = if attempt == 0 { name.to_string() } else { format!("{stem} ({attempt}){extension}") };
+        let target = directory.join(&candidate);
+        let partial = directory.join(format!("{candidate}.crdownload"));
+        if target.exists() {
+            continue;
+        }
+        let mut file = match std::fs::OpenOptions::new().write(true).create_new(true).open(&partial) {
+            Ok(file) => file,
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(error) => return Err(error),
+        };
+        let result = file.write_all(bytes).and_then(|_| file.sync_all());
+        drop(file);
+        if let Err(error) = result.and_then(|_| std::fs::rename(&partial, &target)) {
+            let _ = std::fs::remove_file(&partial);
+            return Err(error);
+        }
+        return Ok(target);
+    }
+    Err(std::io::Error::new(std::io::ErrorKind::AlreadyExists, "no free download file name"))
+}
+
 pub(crate) fn drain_binding_calls(ctx: &mut CdpContext) {
     let mut drained = Vec::new();
     for page in &mut ctx.pages {
@@ -1276,6 +1388,107 @@ async fn dispatch_send_message_to_target(req: &CdpRequest, ctx: &mut CdpContext)
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    async fn download_evaluate(ctx: &mut CdpContext, session: &str, id: u64, expression: &str) -> serde_json::Value {
+        let response = dispatch(
+            &CdpRequest {
+                id,
+                method: "Runtime.evaluate".into(),
+                params: json!({"expression": expression, "returnByValue": true}),
+                session_id: Some(session.to_string()),
+            },
+            ctx,
+        )
+        .await;
+        assert!(response.error.is_none(), "evaluate failed: {:?}", response.error);
+        response.result.unwrap_or_default()
+    }
+
+    const CLICK_BLOB_DOWNLOAD: &str = "(function(){ const url = URL.createObjectURL(new Blob(['deck bytes'], {type: 'application/octet-stream'})); const a = document.createElement('a'); a.href = url; a.download = 'lesson.pptx'; document.body.appendChild(a); a.click(); a.remove(); URL.revokeObjectURL(url); return location.href; })()";
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn an_anchor_download_is_written_and_reported_under_the_context_behavior() {
+        let directory = std::env::temp_dir().join(format!("obscura-download-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&directory).unwrap();
+        let mut ctx = CdpContext::new();
+        let page_id = ctx.create_page();
+        let session = format!("{page_id}-session");
+        ctx.sessions.insert(session.clone(), page_id.clone());
+
+        // No behavior set: nothing is written or reported, and the page stays put.
+        let before = download_evaluate(&mut ctx, &session, 1, "location.href").await;
+        let after = download_evaluate(&mut ctx, &session, 2, CLICK_BLOB_DOWNLOAD).await;
+        assert_eq!(before["result"]["value"], after["result"]["value"], "a download must not navigate the page");
+        assert!(ctx.pending_events.iter().all(|e| !e.method.starts_with("Browser.download")));
+
+        let context = ctx.default_context.id.clone();
+        let set = dispatch(
+            &CdpRequest {
+                id: 3,
+                method: "Browser.setDownloadBehavior".into(),
+                params: json!({"behavior": "allowAndName", "browserContextId": context, "downloadPath": directory.to_str().unwrap(), "eventsEnabled": true}),
+                session_id: None,
+            },
+            &mut ctx,
+        )
+        .await;
+        assert!(set.error.is_none(), "setDownloadBehavior failed: {:?}", set.error);
+        ctx.pending_events.clear();
+        download_evaluate(&mut ctx, &session, 4, CLICK_BLOB_DOWNLOAD).await;
+        let events: Vec<_> = ctx.pending_events.iter().filter(|e| e.method.starts_with("Browser.download")).collect();
+        assert_eq!(events.len(), 2, "one downloadWillBegin and one downloadProgress");
+        assert_eq!(events[0].method, "Browser.downloadWillBegin");
+        assert!(events[0].session_id.is_none(), "download events are browser-level");
+        assert_eq!(events[0].params["suggestedFilename"], "lesson.pptx");
+        assert_eq!(events[0].params["frameId"], ctx.pages.iter().find(|p| p.id == page_id).unwrap().frame_id.as_str());
+        let guid = events[0].params["guid"].as_str().unwrap().to_string();
+        assert_eq!(events[1].method, "Browser.downloadProgress");
+        assert_eq!(events[1].params["guid"], guid.as_str());
+        assert_eq!(events[1].params["state"], "completed");
+        assert_eq!(events[1].params["receivedBytes"], 10);
+        assert_eq!(events[1].params["totalBytes"], 10);
+        assert_eq!(std::fs::read(directory.join(&guid)).unwrap(), b"deck bytes");
+        let entries: Vec<_> = std::fs::read_dir(&directory).unwrap().collect();
+        assert_eq!(entries.len(), 1, "only the finished file, no .crdownload left");
+
+        // deny: nothing more is written or reported.
+        let deny = dispatch(
+            &CdpRequest {
+                id: 5,
+                method: "Browser.setDownloadBehavior".into(),
+                params: json!({"behavior": "deny", "browserContextId": context, "eventsEnabled": false}),
+                session_id: None,
+            },
+            &mut ctx,
+        )
+        .await;
+        assert!(deny.error.is_none());
+        ctx.pending_events.clear();
+        download_evaluate(&mut ctx, &session, 6, CLICK_BLOB_DOWNLOAD).await;
+        assert!(ctx.pending_events.iter().all(|e| !e.method.starts_with("Browser.download")));
+        assert_eq!(std::fs::read_dir(&directory).unwrap().count(), 1);
+        std::fs::remove_dir_all(&directory).unwrap();
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn set_download_behavior_refuses_unknown_contexts_and_missing_paths() {
+        let mut ctx = CdpContext::new();
+        for (params, needle) in [
+            (json!({"behavior": "allow"}), "downloadPath must be provided"),
+            (json!({"behavior": "allow", "downloadPath": "relative/dir"}), "absolute"),
+            (json!({"behavior": "sometimes"}), "Unrecognized download behavior"),
+            (json!({"behavior": "deny", "browserContextId": "no-such-context"}), "Failed to find browser context"),
+        ] {
+            let response = dispatch(
+                &CdpRequest { id: 1, method: "Browser.setDownloadBehavior".into(), params, session_id: None },
+                &mut ctx,
+            )
+            .await;
+            let error = response.error.expect("refused");
+            assert!(error.message.contains(needle), "{} does not mention {needle}", error.message);
+        }
+        assert!(ctx.download_behaviors.is_empty());
+    }
     use crate::types::CdpRequest;
 
     fn req(method: &str) -> CdpRequest {

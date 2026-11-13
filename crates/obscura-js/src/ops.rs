@@ -408,6 +408,10 @@ pub struct ObscuraState {
     // `op_binding_called` op. Drained by the CDP layer after each dispatch
     // and emitted as `Runtime.bindingCalled` events.
     pub pending_binding_calls: Vec<(String, String)>,
+    // Files the page asked to download (an activated `<a download>`), queued
+    // by `op_request_download`. The CDP layer drains them after each dispatch
+    // and event-loop turn and applies the browser context's download behavior.
+    pub pending_downloads: Vec<PendingDownload>,
     // Console calls and uncaught script exceptions, in occurrence order.
     // The CDP layer drains this after commands and autonomous event-loop turns.
     pub pending_runtime_events: VecDeque<RuntimeEvent>,
@@ -681,6 +685,7 @@ impl ObscuraState {
             intercept_url_patterns: Vec::new(),
             intercept_page_id: String::new(),
             pending_binding_calls: Vec::new(),
+            pending_downloads: Vec::new(),
             pending_runtime_events: VecDeque::new(),
             runtime_events_enabled: false,
             pending_console_messages: VecDeque::new(),
@@ -7293,6 +7298,41 @@ fn posted_task_owner(state: &OpState, frame_id: u32) -> Option<SharedState> {
     owner
 }
 
+/// A download the page started: the resource's URL, the name it suggested
+/// (the `download` attribute, else the URL's last path segment) and its bytes.
+#[derive(Debug, Clone)]
+pub struct PendingDownload {
+    pub url: String,
+    pub suggested_filename: String,
+    pub bytes: Vec<u8>,
+}
+
+/// Bound on queued downloads per realm between drains; a page that starts more
+/// in one turn loses the excess rather than growing the queue without limit.
+const MAX_PENDING_DOWNLOADS: usize = 32;
+
+// Records a download started by page JS (HTML "downloads a hyperlink"). The
+// bytes come from the page (a blob: or fetched resource); the CDP layer
+// decides, by Browser.setDownloadBehavior, whether anything is written.
+#[op2(fast)]
+fn op_request_download(
+    state: &OpState,
+    #[string] url: &str,
+    #[string] suggested_filename: &str,
+    #[buffer] bytes: &[u8],
+) {
+    let gs = state.borrow::<SharedState>().clone();
+    let mut gs = gs.borrow_mut();
+    if gs.pending_downloads.len() >= MAX_PENDING_DOWNLOADS {
+        return;
+    }
+    gs.pending_downloads.push(PendingDownload {
+        url: url.to_string(),
+        suggested_filename: suggested_filename.to_string(),
+        bytes: bytes.to_vec(),
+    });
+}
+
 // Records a binding call from page JS. The CDP layer drains this queue
 // after every dispatch and emits one `Runtime.bindingCalled` event per
 // entry, that's how puppeteer's `page.exposeFunction` callbacks fire.
@@ -8216,6 +8256,7 @@ pub fn build_extension() -> Extension {
         op_posted_task(),
         op_posted_task_generation(),
         op_binding_called(),
+        op_request_download(),
         op_subtle_digest(),
         op_subtle_hmac(),
         op_subtle_aes_gcm(),
